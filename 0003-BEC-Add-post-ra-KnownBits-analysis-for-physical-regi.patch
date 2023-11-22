@@ -1,0 +1,554 @@
+From 12468519c76316a172b48beca524bbfbe79cd401 Mon Sep 17 00:00:00 2001
+From: Yousun Ko <yousun.ko@yonsei.ac.kr>
+Date: Mon, 21 Aug 2023 15:10:45 +0900
+Subject: [PATCH 3/7] [BEC] Add post-ra KnownBits analysis for physical
+ registers
+
+---
+ llvm/include/llvm/ADT/APInt.h                 |   5 +
+ llvm/include/llvm/ADT/StringExtras.h          |   7 +
+ .../llvm/CodeGen/MachineRegisterInfo.h        |   4 +
+ .../llvm/CodeGen/PhysKnownBitsAnalysis.h      |  97 ++++++++++
+ .../llvm/CodeGen/TargetKnownBitsInfo.h        |  12 +-
+ llvm/include/llvm/InitializePasses.h          |   1 +
+ llvm/include/llvm/Support/KnownBits.h         |  44 ++++-
+ llvm/lib/CodeGen/CMakeLists.txt               |   1 +
+ llvm/lib/CodeGen/PhysKnownBitsAnalysis.cpp    | 165 ++++++++++++++++++
+ llvm/lib/CodeGen/TargetKnownBitsInfo.cpp      |   6 -
+ llvm/lib/Support/APInt.cpp                    |  51 ++++++
+ 11 files changed, 375 insertions(+), 18 deletions(-)
+ create mode 100644 llvm/include/llvm/CodeGen/PhysKnownBitsAnalysis.h
+ create mode 100644 llvm/lib/CodeGen/PhysKnownBitsAnalysis.cpp
+
+diff --git a/llvm/include/llvm/ADT/APInt.h b/llvm/include/llvm/ADT/APInt.h
+index 2374cfa2dcdc..376b4016343c 100644
+--- a/llvm/include/llvm/ADT/APInt.h
++++ b/llvm/include/llvm/ADT/APInt.h
+@@ -1644,6 +1644,11 @@ public:
+     toString(Str, Radix, true, false);
+   }
+ 
++  /// Converts an APInt to a string and append it to Str.  Str is commonly a
++  /// SmallString.
++  void toStringBits(SmallVectorImpl<char> &Str, unsigned Radix, bool Signed,
++                    bool formatAsCLiteral = false) const;
++
+   /// \returns a byte-swapped representation of this APInt Value.
+   APInt byteSwap() const;
+ 
+diff --git a/llvm/include/llvm/ADT/StringExtras.h b/llvm/include/llvm/ADT/StringExtras.h
+index eec010e89322..f5ff6db0cfd4 100644
+--- a/llvm/include/llvm/ADT/StringExtras.h
++++ b/llvm/include/llvm/ADT/StringExtras.h
+@@ -326,6 +326,13 @@ inline std::string toString(const APSInt &I, unsigned Radix) {
+   return toString(I, Radix, I.isSigned());
+ }
+ 
++inline std::string toStringBits(const APInt &I, unsigned Radix, bool Signed,
++                                bool formatAsCLiteral = false) {
++  SmallString<40> S;
++  I.toStringBits(S, Radix, Signed, formatAsCLiteral);
++  return std::string(S.str());
++}
++
+ /// StrInStrNoCase - Portable version of strcasestr.  Locates the first
+ /// occurrence of string 's1' in string 's2', ignoring case.  Returns
+ /// the offset of s2 in s1 or npos if s2 cannot be found.
+diff --git a/llvm/include/llvm/CodeGen/MachineRegisterInfo.h b/llvm/include/llvm/CodeGen/MachineRegisterInfo.h
+index 7f0c24e4e115..7cc0006d3675 100644
+--- a/llvm/include/llvm/CodeGen/MachineRegisterInfo.h
++++ b/llvm/include/llvm/CodeGen/MachineRegisterInfo.h
+@@ -63,6 +63,10 @@ public:
+     }
+   };
+ 
++  // FIXME: make it private.
++  /// Map for proper DefMOPs for physical registers.
++  DenseMap<MachineOperand*, SmallVector<MachineOperand*, 4>> DefMOPMap;
++
+ private:
+   MachineFunction *MF;
+   SmallPtrSet<Delegate *, 1> TheDelegates;
+diff --git a/llvm/include/llvm/CodeGen/PhysKnownBitsAnalysis.h b/llvm/include/llvm/CodeGen/PhysKnownBitsAnalysis.h
+new file mode 100644
+index 000000000000..e7b8b658da16
+--- /dev/null
++++ b/llvm/include/llvm/CodeGen/PhysKnownBitsAnalysis.h
+@@ -0,0 +1,97 @@
++//===- llvm/CodeGen/PhysKnownBitsAnalysis.h -------------------------*- C++ -*-===//
++//
++// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
++// See https://llvm.org/LICENSE.txt for license information.
++// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++//
++//===----------------------------------------------------------------------===//
++/// \file
++/// Provides analysis for querying information about KnownBits in Machine IR.
++///
++/// Based on the lib/CodeGen/GlobalISel/GISelKnownBits.h, PhysKnownBitsAnalysis
++/// for generic Machine IR (gMIR).
++///
++//===----------------------------------------------------------------------===//
++
++#ifndef LLVM_CODEGEN_PHYSKNOWNBITSANALYSIS_H
++#define LLVM_CODEGEN_PHYSKNOWNBITSANALYSIS_H
++
++#include "llvm/ADT/DenseMap.h"
++#include "llvm/Analysis/ScalarEvolution.h"
++#include "llvm/CodeGen/MachineFunctionPass.h"
++#include "llvm/CodeGen/MachineLoopInfo.h"
++#include "llvm/CodeGen/Register.h"
++#include "llvm/InitializePasses.h"
++#include "llvm/Support/KnownBits.h"
++
++namespace llvm {
++
++class TargetKnownBitsInfo;
++
++class PhysKnownBitsAnalysis {
++  MachineFunction &MF;
++  MachineLoopInfo *MLI;
++  ScalarEvolution *SE;
++  MachineRegisterInfo &MRI;
++  const TargetRegisterInfo &TRI;
++  const TargetKnownBitsInfo &TKBI;
++
++  unsigned MaxDepth;
++  /// Cache maintained during a computeKnownBits request.
++  SmallDenseMap<MachineOperand*, KnownBits, 16> ComputeKnownBitsCache;
++  /// Contains registers with constant/static KnownBits
++  DenseMap<Register, KnownBits> InitRegMap;
++
++public:
++  PhysKnownBitsAnalysis(MachineFunction &MF, MachineLoopInfo &MLI, ScalarEvolution &SE, unsigned MaxDepth = 10);
++  virtual ~PhysKnownBitsAnalysis() = default;
++
++  const MachineFunction &getMachineFunction() const {
++    return MF;
++  }
++
++  virtual void computeKnownBitsImpl(MachineOperand* MOP, KnownBits &Known,
++                                    const APInt &DemandedElts,
++                                    unsigned Depth = 0);
++
++  bool isLoopVariable(MachineOperand *MOP, KnownBits &Known,
++                      const APInt &DemandedElts, unsigned Depth = 0);
++
++  // KnownBits API
++  KnownBits getKnownBits(MachineOperand* MOP);
++  KnownBits getKnownBits(MachineOperand* MOP,
++                         const APInt &DemandedElts, unsigned Depth = 0);
++
++  LLVM_ATTRIBUTE_UNUSED void
++  dumpResult(const MachineOperand *MOP, const KnownBits &Known, unsigned Depth) const;
++  LLVM_ATTRIBUTE_UNUSED void dumpKnownBits(const KnownBits &Known, unsigned Depth) const;
++
++protected:
++  unsigned getMaxDepth() const { return MaxDepth; }
++};
++
++/// To use KnownBitsInfo analysis in a pass,
++/// PhysKnownBitsAnalysis &KB = getAnalysis<KnownBitsAnalysisWrapper>().get(MF);
++
++class PhysKnownBitsAnalysisWrapper : public MachineFunctionPass {
++  std::unique_ptr<PhysKnownBitsAnalysis> Info;
++  MachineLoopInfo *MLI;
++  ScalarEvolution *SE;
++
++public:
++  static char ID;
++  PhysKnownBitsAnalysisWrapper() : MachineFunctionPass(ID) {
++    initializePhysKnownBitsAnalysisWrapperPass(*PassRegistry::getPassRegistry());
++  }
++  PhysKnownBitsAnalysis &get(MachineFunction &MF) {
++    if (!Info)
++      Info = std::make_unique<PhysKnownBitsAnalysis>(MF, *MLI, *SE);
++    return *Info.get();
++  }
++  void getAnalysisUsage(AnalysisUsage &AU) const override;
++  bool runOnMachineFunction(MachineFunction &MF) override;
++  void releaseMemory() override { Info.reset(); }
++};
++} // namespace llvm
++
++#endif // LLVM_CODEGEN_PHYSKNOWNBITSANALYSIS_H
+diff --git a/llvm/include/llvm/CodeGen/TargetKnownBitsInfo.h b/llvm/include/llvm/CodeGen/TargetKnownBitsInfo.h
+index 4a8bc7cdf7b7..5ffcc06526a7 100644
+--- a/llvm/include/llvm/CodeGen/TargetKnownBitsInfo.h
++++ b/llvm/include/llvm/CodeGen/TargetKnownBitsInfo.h
+@@ -8,7 +8,7 @@
+ ///
+ /// \file
+ /// This file provides target-dependent wrapper for KnownBits analysis on
+-/// virtual and physical registers.
++/// physical registers after register allocation.
+ ///
+ ///
+ //===----------------------------------------------------------------------===//
+@@ -25,7 +25,6 @@
+ namespace llvm {
+ 
+ struct KnownBits;
+-class KnownBitsAnalysis;
+ class PhysKnownBitsAnalysis;
+ class TargetMachine;
+ class MachineInstr;
+@@ -47,14 +46,7 @@ public:
+   /// allows us to only collect the known bits that are shared by the
+   /// requested vector elements.
+ 
+-  // for virtual regs
+-  virtual void computeKnownBitsForVReg(KnownBitsAnalysis &AA,
+-                                            Register R, KnownBits &Known,
+-                                            const APInt &DemandedElts,
+-                                            const MachineRegisterInfo &MRI,
+-                                            unsigned Depth = 0) const;
+-
+-  // for physical regs
++ // for physical regs
+   virtual void computeKnownBitsForPhysReg(PhysKnownBitsAnalysis &AA,
+                                           MachineOperand* MOP, KnownBits &Known,
+                                           const APInt &DemandedElts,
+diff --git a/llvm/include/llvm/InitializePasses.h b/llvm/include/llvm/InitializePasses.h
+index 1164cd872eb9..f4b4f074a8b8 100644
+--- a/llvm/include/llvm/InitializePasses.h
++++ b/llvm/include/llvm/InitializePasses.h
+@@ -182,6 +182,7 @@ void initializeInternalizeLegacyPassPass(PassRegistry&);
+ void initializeIntervalPartitionPass(PassRegistry&);
+ void initializeJMCInstrumenterPass(PassRegistry&);
+ void initializeJumpThreadingPass(PassRegistry&);
++void initializePhysKnownBitsAnalysisWrapperPass(PassRegistry &);
+ void initializeLCSSAVerificationPassPass(PassRegistry&);
+ void initializeLCSSAWrapperPassPass(PassRegistry&);
+ void initializeLazyBlockFrequencyInfoPassPass(PassRegistry&);
+diff --git a/llvm/include/llvm/Support/KnownBits.h b/llvm/include/llvm/Support/KnownBits.h
+index 0fb056b25417..c14b8c848340 100644
+--- a/llvm/include/llvm/Support/KnownBits.h
++++ b/llvm/include/llvm/Support/KnownBits.h
+@@ -24,12 +24,11 @@ struct KnownBits {
+   APInt Zero;
+   APInt One;
+ 
+-private:
++public:
+   // Internal constructor for creating a KnownBits from two APInts.
+   KnownBits(APInt Zero, APInt One)
+       : Zero(std::move(Zero)), One(std::move(One)) {}
+ 
+-public:
+   // Default construct Zero and One.
+   KnownBits() = default;
+ 
+@@ -92,6 +91,47 @@ public:
+     One.setAllBits();
+   }
+ 
++  void setUnknown(unsigned BitPos) {
++    Zero.clearBit(BitPos);
++    One.clearBit(BitPos);
++  }
++
++  bool isUnknownBit(unsigned BitPos) {
++    return !Zero[BitPos] && !One[BitPos];
++  }
++
++  bool isUnknownBit(unsigned BitPos) const {
++    return !Zero[BitPos] && !One[BitPos];
++  }
++
++  bool isZeroBit(unsigned BitPos) {
++    assert(!hasConflict() && "KnownBits conflict!");
++    return Zero[BitPos];
++  }
++
++  bool isZeroBit(unsigned BitPos) const {
++    assert(!hasConflict() && "KnownBits conflict!");
++    return Zero[BitPos];
++  }
++
++  bool isOneBit(unsigned BitPos) {
++    assert(!hasConflict() && "KnownBits conflict!");
++    return One[BitPos];
++  }
++
++  bool isOneBit(unsigned BitPos) const {
++    assert(!hasConflict() && "KnownBits conflict!");
++    return One[BitPos];
++  }
++
++  /* return false if the bit is unknown */
++  bool flipABit(unsigned BitPos) {
++    if (isUnknownBit(BitPos)) return false;
++    One.flipBit(BitPos);
++    Zero.flipBit(BitPos);
++    return true;
++  }
++
+   /// Returns true if this value is known to be negative.
+   bool isNegative() const { return One.isSignBitSet(); }
+ 
+diff --git a/llvm/lib/CodeGen/CMakeLists.txt b/llvm/lib/CodeGen/CMakeLists.txt
+index d51d4d18ccb4..55740c3b6c20 100644
+--- a/llvm/lib/CodeGen/CMakeLists.txt
++++ b/llvm/lib/CodeGen/CMakeLists.txt
+@@ -225,6 +225,7 @@ add_llvm_component_library(LLVMCodeGen
+   TargetFrameLoweringImpl.cpp
+   TargetInstrInfo.cpp
+   TargetKnownBitsInfo.cpp
++  PhysKnownBitsAnalysis.cpp
+   TargetLoweringBase.cpp
+   TargetLoweringObjectFileImpl.cpp
+   TargetOptionsImpl.cpp
+diff --git a/llvm/lib/CodeGen/PhysKnownBitsAnalysis.cpp b/llvm/lib/CodeGen/PhysKnownBitsAnalysis.cpp
+new file mode 100644
+index 000000000000..cb04a8d4cebc
+--- /dev/null
++++ b/llvm/lib/CodeGen/PhysKnownBitsAnalysis.cpp
+@@ -0,0 +1,165 @@
++//===-- lib/CodeGen/PhysKnownBitsAnalysis.cpp --------------------*- C++ *-===//
++//
++// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
++// See https://llvm.org/LICENSE.txt for license information.
++// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++//
++//===----------------------------------------------------------------------===//
++//
++/// Provides analysis for querying information about KnownBits in Machine IR.
++///
++/// Based on the lib/CodeGen/GlobalISel/GISelKnownBits.cpp, PhysKnownBitsAnalysis
++/// for generic Machine IR (gMIR).
++//
++//===----------------------------------------------------------------------===//
++#include "llvm/CodeGen/PhysKnownBitsAnalysis.h"
++#include "llvm/CodeGen/MachineFrameInfo.h"
++#include "llvm/CodeGen/MachineLoopInfo.h"
++#include "llvm/CodeGen/MachineRegisterInfo.h"
++#include "llvm/CodeGen/TargetKnownBitsInfo.h"
++#include "llvm/CodeGen/TargetLowering.h"
++#include "llvm/CodeGen/TargetOpcodes.h"
++#include "llvm/IR/Module.h"
++
++using namespace llvm;
++
++#define DEBUG_TYPE "phys-known-bits-analysis"
++
++#define KB_LLVM_DEBUG(x){}
++
++char llvm::PhysKnownBitsAnalysisWrapper::ID = 0;
++
++INITIALIZE_PASS_BEGIN(PhysKnownBitsAnalysisWrapper, DEBUG_TYPE,
++                "Analysis for Physical KnownBits in Machine IR", false, true)
++INITIALIZE_PASS_DEPENDENCY(MachineLoopInfo)
++INITIALIZE_PASS_DEPENDENCY(ScalarEvolutionWrapperPass)
++INITIALIZE_PASS_END(PhysKnownBitsAnalysisWrapper, DEBUG_TYPE,
++                "Analysis for Physical KnownBits in Machine IR", false, true)
++
++PhysKnownBitsAnalysis::PhysKnownBitsAnalysis(MachineFunction &MF, MachineLoopInfo &MLI, ScalarEvolution &SE, unsigned MaxDepth)
++    : MF(MF), MLI(&MLI), SE(&SE), MRI(MF.getRegInfo()),
++      TRI(*MF.getSubtarget().getRegisterInfo()),
++      TKBI(*MF.getSubtarget().getTargetKnownBitsInfo()), MaxDepth(MaxDepth) {}
++
++KnownBits PhysKnownBitsAnalysis::getKnownBits(MachineOperand* MOP) {
++  APInt DemandedElts = APInt(1, 1);
++  return getKnownBits(MOP, DemandedElts);
++}
++
++KnownBits PhysKnownBitsAnalysis::getKnownBits(MachineOperand* MOP,
++                           const APInt &DemandedElts, unsigned Depth) {
++  // For now, we only maintain the cache during one request.
++  assert(ComputeKnownBitsCache.empty() && "Cache should have been cleared");
++  TKBI.getComputeKnownBitsCacheInit(InitRegMap, MRI);
++
++  KB_LLVM_DEBUG(dbgs() << "[" << Depth << "]:BEGIN: getKnownBits(): for "; MOP->print(dbgs()); dbgs() << ": ";MOP->getParent()->dump());
++  KnownBits Known;
++  computeKnownBitsImpl(MOP, Known, DemandedElts);
++  ComputeKnownBitsCache.clear();
++  KB_LLVM_DEBUG(dbgs() << "[" << Depth << "]:  END:\n");
++  KB_LLVM_DEBUG(dumpKnownBits(Known, Depth));
++  return Known;
++}
++
++void PhysKnownBitsAnalysis::computeKnownBitsImpl(MachineOperand* MOP,
++                KnownBits &Known, const APInt &DemandedElts, unsigned Depth) {
++  assert(MOP->isReg() && "MOP is not register");
++  Register R = MOP->getReg();
++  LLVM_DEBUG(dbgs() << "    [" << Depth << "] computeKnownBitsImpl("
++                    <<printReg(R, &TRI) <<"): "; MOP->getParent()->dump());
++
++  unsigned BitWidth = TRI.getRegSizeInBits(R, MRI);
++  if (InitRegMap.find(R) != InitRegMap.end()) {
++    Known = InitRegMap[R];
++    LLVM_DEBUG(dbgs() << "Cache hit at "<< printReg(R, &TRI) << "\n");
++    return;
++  }
++
++  auto CacheEntry = ComputeKnownBitsCache.find(MOP);
++  if (CacheEntry != ComputeKnownBitsCache.end()) {
++    Known = CacheEntry->second;
++    LLVM_DEBUG(dbgs() << "Cache hit at :";MOP->dump();
++               dbgs() << ": "; MOP->getParent()->dump(););
++    assert(Known.getBitWidth() == BitWidth && "Cache entry size doesn't match");
++    return;
++  }
++
++  Known = KnownBits(BitWidth); // Don't know anything
++
++  // Depth may get bigger than max depth if it gets passed to a different
++  // PhysKnownBitsAnalysis object.
++  // This may happen when say a generic part uses a PhysKnownBitsAnalysis object
++  // with some max depth, but then we hit TL.computeKnownBitsForTargetInstr
++  // which creates a new PhysKnownBitsAnalysis object with a different and smaller
++  // depth. If we just check for equality, we would never exit if the depth
++  // that is passed down to the target specific PhysKnownBitsAnalysis object is
++  // already bigger than its max depth.
++  if (Depth >= getMaxDepth())
++    return;
++
++  if (!DemandedElts)
++    return; // No demanded elts, better to assume we don't know anything.
++
++  if (MOP->isDef()) {
++    KB_LLVM_DEBUG(dbgs() << "["<<Depth<<"]: MOP ("; MOP->print(dbgs()); dbgs() <<") is Def\n");
++    TKBI.computeKnownBitsForPhysReg(*this, MOP, Known, DemandedElts, MRI, Depth);
++    KB_LLVM_DEBUG(dumpResult(MOP, Known, Depth));
++  } else {
++    // A physical register may have multiple defs. Intersect all.
++    KB_LLVM_DEBUG(dbgs() << "["<<Depth<<"]: MOP (";MOP->print(dbgs()); dbgs()<<") is Use\n");
++    for (unsigned i = 0, e = MRI.DefMOPMap[MOP].size(); i < e; i++) {
++      MachineOperand *defMOP = MRI.DefMOPMap[MOP][i];
++      KnownBits KnownDef = KnownBits(BitWidth); // Don't know anything yet
++      KB_LLVM_DEBUG(dbgs() << "["<<Depth<<"]: Def MOP ["<<i<<"]: ";defMOP->print(dbgs()); dbgs() << " in "; defMOP->getParent()->dump());
++      TKBI.computeKnownBitsForPhysReg(*this, defMOP, KnownDef, DemandedElts, MRI, Depth);
++      KB_LLVM_DEBUG(dumpResult(defMOP, KnownDef, Depth));
++
++      if (i == 0) {
++        // deepcopy
++        Known = KnownBits(KnownDef.Zero, KnownDef.One);
++      } else {
++        // intersect
++        Known = KnownBits::commonBits(Known, KnownDef);
++      }
++    }
++    KB_LLVM_DEBUG(dumpResult(MOP, Known, Depth));
++  }
++
++  assert(!Known.hasConflict() && "Bits known to be one AND zero?");
++  LLVM_DEBUG(dumpResult(MOP, Known, Depth));
++
++  // Update the cache.
++  ComputeKnownBitsCache[MOP] = Known;
++}
++
++LLVM_ATTRIBUTE_UNUSED void
++PhysKnownBitsAnalysis::dumpResult(const MachineOperand *MOP,
++    const KnownBits &Known, unsigned Depth) const {
++  dbgs() << "[" << Depth << "] KnownBits result for "; MOP->print(dbgs());
++  dbgs() << " in "; MOP->getParent()->dump();
++  dumpKnownBits(Known, Depth);
++}
++
++LLVM_ATTRIBUTE_UNUSED void
++PhysKnownBitsAnalysis::dumpKnownBits(const KnownBits &Known, unsigned Depth) const {
++  dbgs() << "[" << Depth << "] Known: 0x"
++         << toStringBits(Known.Zero | Known.One, 16, false)
++         << " (0x" << toString(Known.Zero | Known.One, 16, false) << ")\n"
++         << "[" << Depth << "] Zero : 0x" << toStringBits(Known.Zero, 16, false)
++         << " (0x" << toString(Known.Zero, 16, false) << ")\n"
++         << "[" << Depth << "] One  : 0x" << toStringBits(Known.One, 16, false)
++         << " (0x" << toString(Known.One, 16, false) << ")\n";
++}
++
++void PhysKnownBitsAnalysisWrapper::getAnalysisUsage(AnalysisUsage &AU) const {
++  AU.setPreservesAll();
++  AU.addRequired<MachineLoopInfo>();
++  AU.addRequired<ScalarEvolutionWrapperPass>();
++  MachineFunctionPass::getAnalysisUsage(AU);
++}
++
++bool PhysKnownBitsAnalysisWrapper::runOnMachineFunction(MachineFunction &MF) {
++  MLI = &getAnalysis<MachineLoopInfo>();
++  SE = &getAnalysis<ScalarEvolutionWrapperPass>().getSE();
++  return false;
++}
+diff --git a/llvm/lib/CodeGen/TargetKnownBitsInfo.cpp b/llvm/lib/CodeGen/TargetKnownBitsInfo.cpp
+index 5643a0ef03c0..5b46caa2824a 100644
+--- a/llvm/lib/CodeGen/TargetKnownBitsInfo.cpp
++++ b/llvm/lib/CodeGen/TargetKnownBitsInfo.cpp
+@@ -16,12 +16,6 @@
+ 
+ using namespace llvm;
+ 
+-void TargetKnownBitsInfo::computeKnownBitsForVReg(KnownBitsAnalysis &AA,
+-    Register R, KnownBits &Known, const APInt &DemandedElts,
+-    const MachineRegisterInfo &MRI, unsigned Depth) const {
+-  Known.resetAll();
+-}
+-
+ void TargetKnownBitsInfo::computeKnownBitsForPhysReg(PhysKnownBitsAnalysis &AA,
+     MachineOperand* MOP, KnownBits &Known, const APInt &DemandedElts,
+     const MachineRegisterInfo &MRI, unsigned Depth) const {
+diff --git a/llvm/lib/Support/APInt.cpp b/llvm/lib/Support/APInt.cpp
+index afe7478a8b2a..915fcf5f3677 100644
+--- a/llvm/lib/Support/APInt.cpp
++++ b/llvm/lib/Support/APInt.cpp
+@@ -2249,6 +2249,57 @@ void APInt::toString(SmallVectorImpl<char> &Str, unsigned Radix,
+   std::reverse(Str.begin()+StartDig, Str.end());
+ }
+ 
++void APInt::toStringBits(SmallVectorImpl<char> &Str, unsigned Radix,
++                         bool Signed, bool formatAsCLiteral) const {
++  toString(Str, Radix, Signed, formatAsCLiteral);
++
++  SmallString<200> newStr;
++
++  // zext
++  for (unsigned i = Str.size(), e = getBitWidth()/4; i < e; i++) {
++    newStr.append("0000 ");
++  }
++
++  // convert hex to binary
++  for(unsigned i = 0, e = Str.size(); i < e; i++) {
++    char C = Str[i];
++    if (C == '0') {
++      newStr.append("0000 ");
++    } else if (C == '1') {
++      newStr.append("0001 ");
++    } else if (C == '2') {
++      newStr.append("0010 ");
++    } else if (C == '3') {
++      newStr.append("0011 ");
++    } else if (C == '4') {
++      newStr.append("0100 ");
++    } else if (C == '5') {
++      newStr.append("0101 ");
++    } else if (C == '6') {
++      newStr.append("0110 ");
++    } else if (C == '7') {
++      newStr.append("0111 ");
++    } else if (C == '8') {
++      newStr.append("1000 ");
++    } else if (C == '9') {
++      newStr.append("1001 ");
++    } else if (C == 'A') {
++      newStr.append("1010 ");
++    } else if (C == 'B') {
++      newStr.append("1011 ");
++    } else if (C == 'C') {
++      newStr.append("1100 ");
++    } else if (C == 'D') {
++      newStr.append("1101 ");
++    } else if (C == 'E') {
++      newStr.append("1110 ");
++    } else if (C == 'F') {
++      newStr.append("1111 ");
++    }
++  }
++  Str = newStr;
++}
++
+ #if !defined(NDEBUG) || defined(LLVM_ENABLE_DUMP)
+ LLVM_DUMP_METHOD void APInt::dump() const {
+   SmallString<40> S, U;
+-- 
+2.25.1
+

@@ -1,0 +1,199 @@
+From 1851e5d613be64997361f744dc169932e84e0bbe Mon Sep 17 00:00:00 2001
+From: "yousun.ko@yonsei.ac.kr" <yousun.ko@yonsei.ac.kr>
+Date: Fri, 17 Nov 2023 22:06:14 +0900
+Subject: [PATCH 2/7] [BEC][RISCV] Generate auxiliary register info in RISC-V
+ assembly
+
+---
+ llvm/lib/Target/RISCV/RISCVAsmPrinter.cpp  | 100 ++++++++++++++++++++-
+ llvm/lib/Target/RISCV/RISCVMCInstLower.cpp |  21 +++++
+ 2 files changed, 119 insertions(+), 2 deletions(-)
+
+diff --git a/llvm/lib/Target/RISCV/RISCVAsmPrinter.cpp b/llvm/lib/Target/RISCV/RISCVAsmPrinter.cpp
+index a4b999e6aa3b..235c78fd8e4b 100644
+--- a/llvm/lib/Target/RISCV/RISCVAsmPrinter.cpp
++++ b/llvm/lib/Target/RISCV/RISCVAsmPrinter.cpp
+@@ -21,6 +21,7 @@
+ #include "llvm/ADT/Statistic.h"
+ #include "llvm/BinaryFormat/ELF.h"
+ #include "llvm/CodeGen/AsmPrinter.h"
++#include "llvm/CodeGen/LivePhysRegs.h"
+ #include "llvm/CodeGen/MachineConstantPool.h"
+ #include "llvm/CodeGen/MachineFunctionPass.h"
+ #include "llvm/CodeGen/MachineInstr.h"
+@@ -58,6 +59,7 @@ public:
+   bool runOnMachineFunction(MachineFunction &MF) override;
+ 
+   void emitInstruction(const MachineInstr *MI) override;
++  void emitBasicBlockStart(const MachineBasicBlock &MBB) override;
+ 
+   bool PrintAsmOperand(const MachineInstr *MI, unsigned OpNo,
+                        const char *ExtraCode, raw_ostream &OS) override;
+@@ -83,6 +85,9 @@ public:
+ 
+   void emitFunctionEntryLabel() override;
+ 
++  // Set register liveness on MachineInstr to be passed on to MCInst.
++  void setRegLiveness();
++
+ private:
+   void emitAttributes();
+ };
+@@ -91,8 +96,24 @@ private:
+ void RISCVAsmPrinter::EmitToStreamer(MCStreamer &S, const MCInst &Inst) {
+   MCInst CInst;
+   bool Res = RISCVRVC::compress(CInst, Inst, *STI);
+-  if (Res)
++  if (Res) {
++    // copy the accessed/live register info.
++    for (MCPhysReg Reg : Inst.DefRegs)
++      CInst.DefRegs.push_back(Reg);
++    for (MCPhysReg Reg : Inst.UseRegs)
++      CInst.UseRegs.push_back(Reg);
++    for (MCPhysReg Reg : Inst.LiveRegsIn)
++      CInst.LiveRegsIn.push_back(Reg);
++    for (MCPhysReg Reg : Inst.LiveRegsOut)
++      CInst.LiveRegsOut.push_back(Reg);
++    for (unsigned i = 0, e = Inst.DefRegMOPs.size(); i < e; i++)
++      CInst.DefRegMOPs.push_back(Inst.DefRegMOPs[i]);
++    for (unsigned i = 0, e = Inst.UseRegMOPs.size(); i < e; i++)
++      CInst.UseRegMOPs.push_back(Inst.UseRegMOPs[i]);
++    for (auto &V : Inst.RIMap)
++      CInst.RIMap[V.first] = V.second;
+     ++RISCVNumInstrsCompressed;
++  }
+   AsmPrinter::EmitToStreamer(*OutStreamer, Res ? CInst : Inst);
+ }
+ 
+@@ -191,10 +212,78 @@ bool RISCVAsmPrinter::runOnMachineFunction(MachineFunction &MF) {
+   STI = &MF.getSubtarget<RISCVSubtarget>();
+ 
+   SetupMachineFunction(MF);
++  setRegLiveness();
+   emitFunctionBody();
+   return false;
+ }
+ 
++void RISCVAsmPrinter::setRegLiveness() {
++  const TargetRegisterInfo *TRI = MF->getSubtarget().getRegisterInfo();
++  LivePhysRegs LiveRegs;
++  LiveRegs.init(*TRI);
++
++  for (auto &MBB : *MF) {
++    LiveRegs.clear();
++    LiveRegs.addLiveOuts(MBB);
++    //LiveRegs.addLiveOutsNoPristines(MBB);
++
++    MBB.clearAccessedRegs();
++
++    MachineBasicBlock::iterator I = MBB.end(), E = MBB.begin();
++    if (I == E) continue;
++    do {
++      --I;
++
++      // Add (implicit)def registers to DefRegs
++      I->DefRegs.clear();
++      for (const MachineOperand &MOP : phys_regs_and_masks(*I)) {
++        if (MOP.isRegMask()) {
++          for (MCPhysReg Reg : LiveRegs) {
++            if (MOP.clobbersPhysReg(Reg)) {
++              I->DefRegs.push_back(Reg);
++              MBB.addAccessedReg(Reg);
++            }
++          }
++          continue;
++        }
++        if (MOP.isDef()) {
++          I->DefRegs.push_back(MOP.getReg());
++          MBB.addAccessedReg(MOP.getReg());
++        }
++      }
++
++      // Add read registers to UseRegs
++      for (const MachineOperand &MOP : phys_regs_and_masks(*I)) {
++        if (!MOP.isReg() || !MOP.readsReg())
++          continue;
++        I->UseRegs.push_back(MOP.getReg());
++        MBB.addAccessedReg(MOP.getReg());
++      }
++
++      if (I->isReturn()) {
++        I->UseRegs.push_back(RISCV::X1);
++        MBB.addAccessedReg(RISCV::X1);
++      }
++
++      // Update LiveRegsOut
++      I->LiveRegsOut.clear();
++      for (MCPhysReg Reg : LiveRegs) {
++        I->LiveRegsOut.push_back(Reg);
++      }
++
++      // Progress backward
++      LiveRegs.stepBackward(*I);
++
++      // Update LiveRegsIn
++      I->LiveRegsIn.clear();
++      for (MCPhysReg Reg : LiveRegs) {
++        I->LiveRegsIn.push_back(Reg);
++      }
++
++    } while (I != E);
++  }
++}
++
+ void RISCVAsmPrinter::emitStartOfAsmFile(Module &M) {
+   RISCVTargetStreamer &RTS =
+       static_cast<RISCVTargetStreamer &>(*OutStreamer->getTargetStreamer());
+@@ -230,9 +319,16 @@ void RISCVAsmPrinter::emitFunctionEntryLabel() {
+         static_cast<RISCVTargetStreamer &>(*OutStreamer->getTargetStreamer());
+     RTS.emitDirectiveVariantCC(*CurrentFnSym);
+   }
+-  return AsmPrinter::emitFunctionEntryLabel();
++  AsmPrinter::emitFunctionEntryLabel();
++  OutStreamer->emitMFLiveIns(MF);
++}
++
++void RISCVAsmPrinter::emitBasicBlockStart(const MachineBasicBlock &MBB) {
++  AsmPrinter::emitBasicBlockStart(MBB);
++  OutStreamer->emitMBBLiveIns(&MBB);
+ }
+ 
++
+ // Force static initialization.
+ extern "C" LLVM_EXTERNAL_VISIBILITY void LLVMInitializeRISCVAsmPrinter() {
+   RegisterAsmPrinter<RISCVAsmPrinter> X(getTheRISCV32Target());
+diff --git a/llvm/lib/Target/RISCV/RISCVMCInstLower.cpp b/llvm/lib/Target/RISCV/RISCVMCInstLower.cpp
+index 281918259cdb..c50db0131b97 100644
+--- a/llvm/lib/Target/RISCV/RISCVMCInstLower.cpp
++++ b/llvm/lib/Target/RISCV/RISCVMCInstLower.cpp
+@@ -215,6 +215,27 @@ static bool lowerRISCVVMachineInstrToMCInst(const MachineInstr *MI,
+ 
+ bool llvm::lowerRISCVMachineInstrToMCInst(const MachineInstr *MI, MCInst &OutMI,
+                                           AsmPrinter &AP) {
++  // copy the def register info.
++  for (MCPhysReg Reg : MI->DefRegs)
++    OutMI.DefRegs.push_back(Reg);
++  // copy the use register info.
++  for (MCPhysReg Reg : MI->UseRegs)
++    OutMI.UseRegs.push_back(Reg);
++  // copy the live register info.
++  for (MCPhysReg Reg : MI->LiveRegsIn)
++    OutMI.LiveRegsIn.push_back(Reg);
++  for (MCPhysReg Reg : MI->LiveRegsOut)
++    OutMI.LiveRegsOut.push_back(Reg);
++  // copy the DefRegMOPs
++  for (unsigned i = 0, e = MI->DefRegMOPs.size(); i < e; i++)
++    OutMI.DefRegMOPs.push_back(MI->DefRegMOPs[i]);
++  // copy the UseRegMOPs
++  for (unsigned i = 0, e = MI->UseRegMOPs.size(); i < e; i++)
++    OutMI.UseRegMOPs.push_back(MI->UseRegMOPs[i]);
++  // copy the RIMap
++  for (auto &V : MI->RIMap)
++    OutMI.RIMap[V.first] = V.second;
++
+   if (lowerRISCVVMachineInstrToMCInst(MI, OutMI))
+     return false;
+ 
+-- 
+2.25.1
+

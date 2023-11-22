@@ -1,0 +1,602 @@
+From 799a88d5e9b499953e1f7f979b43df6dcc5e14cc Mon Sep 17 00:00:00 2001
+From: "yousun.ko@yonsei.ac.kr" <yousun.ko@yonsei.ac.kr>
+Date: Fri, 17 Nov 2023 22:05:54 +0900
+Subject: [PATCH 1/7] [BEC] Generate auxiliary register infor in assembly
+
+---
+ llvm/include/llvm/CodeGen/MachineBasicBlock.h |  39 +++++++
+ llvm/include/llvm/CodeGen/MachineInstr.h      |  33 ++++++
+ .../llvm/CodeGen/TargetKnownBitsInfo.h        |  69 ++++++++++++
+ .../llvm/CodeGen/TargetSubtargetInfo.h        |   4 +
+ llvm/include/llvm/MC/MCELFStreamer.h          |   2 +
+ llvm/include/llvm/MC/MCInst.h                 |  17 +++
+ llvm/include/llvm/MC/MCObjectStreamer.h       |   2 +
+ llvm/include/llvm/MC/MCStreamer.h             |  12 ++-
+ llvm/lib/CodeGen/AsmPrinter/AsmPrinter.cpp    |   4 +-
+ llvm/lib/CodeGen/CMakeLists.txt               |   1 +
+ llvm/lib/CodeGen/MachineInstr.cpp             |   1 +
+ llvm/lib/CodeGen/TargetKnownBitsInfo.cpp      |  33 ++++++
+ llvm/lib/MC/MCAsmStreamer.cpp                 | 101 ++++++++++++++++++
+ llvm/lib/MC/MCMachOStreamer.cpp               |   2 +
+ llvm/utils/TableGen/PseudoLoweringEmitter.cpp |  13 +++
+ 15 files changed, 331 insertions(+), 2 deletions(-)
+ create mode 100644 llvm/include/llvm/CodeGen/TargetKnownBitsInfo.h
+ create mode 100644 llvm/lib/CodeGen/TargetKnownBitsInfo.cpp
+
+diff --git a/llvm/include/llvm/CodeGen/MachineBasicBlock.h b/llvm/include/llvm/CodeGen/MachineBasicBlock.h
+index 1ab24b554f5b..79a874f899ee 100644
+--- a/llvm/include/llvm/CodeGen/MachineBasicBlock.h
++++ b/llvm/include/llvm/CodeGen/MachineBasicBlock.h
+@@ -132,6 +132,9 @@ private:
+   using LiveInVector = std::vector<RegisterMaskPair>;
+   LiveInVector LiveIns;
+ 
++  /// Keep track of the physical registers that are livein of the MBB.
++  SmallVector<MCPhysReg, 8> AccessedRegs;
++
+   /// Alignment of the basic block. One if the basic block does not need to be
+   /// aligned.
+   Align Alignment;
+@@ -413,6 +416,42 @@ public:
+     LiveIns.push_back(RegMaskPair);
+   }
+ 
++  void clearAccessedRegs() {
++    AccessedRegs.clear();
++  }
++
++  void addAccessedReg(MCPhysReg PhysReg) {
++    bool found = false;
++    for (unsigned i = 0, e = AccessedRegs.size(); i < e; i++) {
++      if (AccessedRegs[i] == PhysReg) {
++        found = true;
++        break;
++      }
++    }
++
++    if (!found) {
++      AccessedRegs.push_back(PhysReg);
++    }
++  }
++
++  unsigned getAccessedRegsSize() {
++    return AccessedRegs.size();
++  }
++
++  MCPhysReg getAccessedRegs(unsigned index) {
++    assert (index < AccessedRegs.size() && "index out of bound");
++    return AccessedRegs[index];
++  }
++
++  unsigned getAccessedRegsSize() const {
++    return AccessedRegs.size();
++  }
++
++  MCPhysReg getAccessedRegs(unsigned index) const {
++    assert (index < AccessedRegs.size() && "index out of bound");
++    return AccessedRegs[index];
++  }
++
+   /// Sorts and uniques the LiveIns vector. It can be significantly faster to do
+   /// this than repeatedly calling isLiveIn before calling addLiveIn for every
+   /// LiveIn insertion.
+diff --git a/llvm/include/llvm/CodeGen/MachineInstr.h b/llvm/include/llvm/CodeGen/MachineInstr.h
+index 272360e12372..1b2b91cc1601 100644
+--- a/llvm/include/llvm/CodeGen/MachineInstr.h
++++ b/llvm/include/llvm/CodeGen/MachineInstr.h
+@@ -114,10 +114,33 @@ public:
+                                         // this instruction.
+   };
+ 
++  // Result index (RI) related variables.
++  // These values are set by RISCVPostRegAllocComputeFIPruningScore.cpp.
++  // Run RISCVPostRegAllocComputeFIPruningScore pass before the MC emission.
++
++  // List of registers accessed or live.
++  SmallVector<MCPhysReg> DefRegs;
++  SmallVector<MCPhysReg> UseRegs;
++  SmallVector<MCPhysReg> LiveRegsIn;
++  SmallVector<MCPhysReg> LiveRegsOut;
++
++  // List of registers defined and used per MachineOperands.
++  // These vars conveys MachineOperand-level info to the MC-level to be
++  // emitted on assembly.
++  SmallVector<MachineOperand*, 4> DefRegMOPs;
++  SmallVector<MachineOperand*, 4> UseRegMOPs;
++
++  // List of RIs assigned per MachineOperands.
++  // RIs(uint32_t) are paired with bit-position(uint8_t).
++  DenseMap<MachineOperand*, SmallVector<std::pair<uint8_t, uint32_t>, 4>> RIMap;
++
++
+ private:
+   const MCInstrDesc *MCID;              // Instruction descriptor.
+   MachineBasicBlock *Parent = nullptr;  // Pointer to the owning basic block.
+ 
++  const Instruction *I = nullptr;       // LLVM-IR Instruction.
++
+   // Operands are allocated by an ArrayRecycler.
+   MachineOperand *Operands = nullptr;   // Pointer to the first operand.
+   unsigned NumOperands = 0;             // Number of operands on instruction.
+@@ -1858,6 +1881,16 @@ public:
+   /// Copy all flags to MachineInst MIFlags
+   void copyIRFlags(const Instruction &I);
+ 
++  /// Set corresponding LLVM-IR instruction.
++  void setInstruction(const Instruction *Inst) {
++    I = Inst;
++  }
++
++  /// Return the corresponding LLVM-IR instruction.
++  const Instruction* getInstruction() const {
++    return I;
++  }
++
+   /// Break any tie involving OpIdx.
+   void untieRegOperand(unsigned OpIdx) {
+     MachineOperand &MO = getOperand(OpIdx);
+diff --git a/llvm/include/llvm/CodeGen/TargetKnownBitsInfo.h b/llvm/include/llvm/CodeGen/TargetKnownBitsInfo.h
+new file mode 100644
+index 000000000000..4a8bc7cdf7b7
+--- /dev/null
++++ b/llvm/include/llvm/CodeGen/TargetKnownBitsInfo.h
+@@ -0,0 +1,69 @@
++//===- llvm/CodeGen/TargetKnownBitsInfo.h - Target KnownBits Info - C++ -*-===//
++//
++// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
++// See https://llvm.org/LICENSE.txt for license information.
++// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++//
++//===----------------------------------------------------------------------===//
++///
++/// \file
++/// This file provides target-dependent wrapper for KnownBits analysis on
++/// virtual and physical registers.
++///
++///
++//===----------------------------------------------------------------------===//
++
++#ifndef LLVM_CODEGEN_TARGETKNOWNBITS_H
++#define LLVM_CODEGEN_TARGETKNOWNBITS_H
++
++#include "llvm/ADT/APInt.h"
++#include "llvm/ADT/DenseMap.h"
++#include "llvm/CodeGen/Register.h"
++#include "llvm/Support/Debug.h"
++#include "llvm/Support/KnownBits.h"
++
++namespace llvm {
++
++struct KnownBits;
++class KnownBitsAnalysis;
++class PhysKnownBitsAnalysis;
++class TargetMachine;
++class MachineInstr;
++class MachineOperand;
++class MachineRegisterInfo;
++
++class TargetKnownBitsInfo {
++private:
++  const TargetMachine &TM;
++
++public:
++  TargetKnownBitsInfo(const TargetKnownBitsInfo &) = delete;
++  TargetKnownBitsInfo &operator=(const TargetKnownBitsInfo &) = delete;
++
++  TargetKnownBitsInfo(const TargetMachine &TM) : TM(TM) {}
++
++  /// Analyze which of the bits of registers are known or not, and return the
++  /// results in the KnownZero/KnownOne bitsets. The DemandedElts argument
++  /// allows us to only collect the known bits that are shared by the
++  /// requested vector elements.
++
++  // for virtual regs
++  virtual void computeKnownBitsForVReg(KnownBitsAnalysis &AA,
++                                            Register R, KnownBits &Known,
++                                            const APInt &DemandedElts,
++                                            const MachineRegisterInfo &MRI,
++                                            unsigned Depth = 0) const;
++
++  // for physical regs
++  virtual void computeKnownBitsForPhysReg(PhysKnownBitsAnalysis &AA,
++                                          MachineOperand* MOP, KnownBits &Known,
++                                          const APInt &DemandedElts,
++                                          const MachineRegisterInfo &MRI,
++                                          unsigned Depth = 0) const;
++
++  virtual void getComputeKnownBitsCacheInit(DenseMap<Register, KnownBits> &cacheInitMap, const MachineRegisterInfo &MRI) const;
++};
++
++} // end namespace llvm
++
++#endif // LLVM_CODEGEN_TARGETKNOWNBITS_H
+diff --git a/llvm/include/llvm/CodeGen/TargetSubtargetInfo.h b/llvm/include/llvm/CodeGen/TargetSubtargetInfo.h
+index 1312ae602162..353269063b72 100644
+--- a/llvm/include/llvm/CodeGen/TargetSubtargetInfo.h
++++ b/llvm/include/llvm/CodeGen/TargetSubtargetInfo.h
+@@ -47,6 +47,7 @@ class SelectionDAGTargetInfo;
+ class SUnit;
+ class TargetFrameLowering;
+ class TargetInstrInfo;
++class TargetKnownBitsInfo;
+ class TargetLowering;
+ class TargetRegisterClass;
+ class TargetRegisterInfo;
+@@ -97,6 +98,9 @@ public:
+     return nullptr;
+   }
+   virtual const TargetLowering *getTargetLowering() const { return nullptr; }
++  virtual const TargetKnownBitsInfo *getTargetKnownBitsInfo() const {
++    return nullptr;
++  }
+   virtual const SelectionDAGTargetInfo *getSelectionDAGInfo() const {
+     return nullptr;
+   }
+diff --git a/llvm/include/llvm/MC/MCELFStreamer.h b/llvm/include/llvm/MC/MCELFStreamer.h
+index 1309b17bff9c..da636da2bea4 100644
+--- a/llvm/include/llvm/MC/MCELFStreamer.h
++++ b/llvm/include/llvm/MC/MCELFStreamer.h
+@@ -49,6 +49,8 @@ public:
+   void initSections(bool NoExecStack, const MCSubtargetInfo &STI) override;
+   void changeSection(MCSection *Section, const MCExpr *Subsection) override;
+   void emitLabel(MCSymbol *Symbol, SMLoc Loc = SMLoc()) override;
++  void emitMFLiveIns(MachineFunction *MF, SMLoc Loc = SMLoc()) override {}
++  void emitMBBLiveIns(const MachineBasicBlock *MBB, SMLoc Loc = SMLoc()) override {}
+   void emitLabelAtPos(MCSymbol *Symbol, SMLoc Loc, MCFragment *F,
+                       uint64_t Offset) override;
+   void emitAssemblerFlag(MCAssemblerFlag Flag) override;
+diff --git a/llvm/include/llvm/MC/MCInst.h b/llvm/include/llvm/MC/MCInst.h
+index 2bc310852fe5..520ecd1f0588 100644
+--- a/llvm/include/llvm/MC/MCInst.h
++++ b/llvm/include/llvm/MC/MCInst.h
+@@ -18,6 +18,7 @@
+ #include "llvm/ADT/SmallVector.h"
+ #include "llvm/ADT/StringRef.h"
+ #include "llvm/ADT/bit.h"
++#include "llvm/MC/MCRegisterInfo.h"
+ #include "llvm/Support/SMLoc.h"
+ #include <cassert>
+ #include <cstddef>
+@@ -31,6 +32,8 @@ class MCInstPrinter;
+ class MCRegisterInfo;
+ class raw_ostream;
+ 
++class MachineOperand;
++
+ /// Instances of this class represent operands of the MCInst class.
+ /// This is a simple discriminated union.
+ class MCOperand {
+@@ -191,6 +194,20 @@ class MCInst {
+   SMLoc Loc;
+   SmallVector<MCOperand, 10> Operands;
+ 
++public:
++  // List of registers that are accessed (DefRegs, UseRegs) and
++  // live (LiveRegsIn, LiveRegsOut) per MCInst.
++  SmallVector<MCPhysReg, 8> DefRegs;
++  SmallVector<MCPhysReg, 8> UseRegs;
++  SmallVector<MCPhysReg, 8> LiveRegsIn;
++  SmallVector<MCPhysReg, 8> LiveRegsOut;
++
++  // Info passed from MachineInstr-level. See MachineInstr.h for more info.
++  SmallVector<MachineOperand*, 4> DefRegMOPs;
++  SmallVector<MachineOperand*, 4> UseRegMOPs;
++  DenseMap<MachineOperand*, SmallVector<std::pair<uint8_t, uint32_t>, 4>> RIMap;
++
++
+ public:
+   MCInst() = default;
+ 
+diff --git a/llvm/include/llvm/MC/MCObjectStreamer.h b/llvm/include/llvm/MC/MCObjectStreamer.h
+index 52ddaf348829..90ab02596698 100644
+--- a/llvm/include/llvm/MC/MCObjectStreamer.h
++++ b/llvm/include/llvm/MC/MCObjectStreamer.h
+@@ -131,6 +131,8 @@ public:
+   /// @{
+ 
+   void emitLabel(MCSymbol *Symbol, SMLoc Loc = SMLoc()) override;
++  void emitMFLiveIns(MachineFunction *MF, SMLoc Loc = SMLoc()) override {}
++  void emitMBBLiveIns(const MachineBasicBlock *MBB, SMLoc Loc = SMLoc()) override {}
+   virtual void emitLabelAtPos(MCSymbol *Symbol, SMLoc Loc, MCFragment *F,
+                               uint64_t Offset);
+   void emitAssignment(MCSymbol *Symbol, const MCExpr *Value) override;
+diff --git a/llvm/include/llvm/MC/MCStreamer.h b/llvm/include/llvm/MC/MCStreamer.h
+index e15fb485b54a..9e0e7719e691 100644
+--- a/llvm/include/llvm/MC/MCStreamer.h
++++ b/llvm/include/llvm/MC/MCStreamer.h
+@@ -17,6 +17,8 @@
+ #include "llvm/ADT/DenseMap.h"
+ #include "llvm/ADT/SmallVector.h"
+ #include "llvm/ADT/StringRef.h"
++#include "llvm/CodeGen/MachineBasicBlock.h"
++#include "llvm/CodeGen/MachineFunction.h"
+ #include "llvm/MC/MCDirectives.h"
+ #include "llvm/MC/MCDwarf.h"
+ #include "llvm/MC/MCLinkerOptimizationHint.h"
+@@ -102,6 +104,11 @@ public:
+ 
+   // Allow a target to add behavior to the EmitLabel of MCStreamer.
+   virtual void emitLabel(MCSymbol *Symbol);
++  // Emit LiveIns of MF
++  virtual void emitMFLiveIns(MachineFunction *MF, SMLoc Loc = SMLoc()) {}
++  // Emit LiveIns of MBB
++  virtual void emitMBBLiveIns(const MachineBasicBlock *MBB, SMLoc Loc = SMLoc()) {}
++
+   // Allow a target to add behavior to the emitAssignment of MCStreamer.
+   virtual void emitAssignment(MCSymbol *Symbol, const MCExpr *Value);
+ 
+@@ -485,7 +492,10 @@ public:
+   // FIXME: These emission are non-const because we mutate the symbol to
+   // add the section we're emitting it to later.
+   virtual void emitLabel(MCSymbol *Symbol, SMLoc Loc = SMLoc());
+-
++  // Emit LiveIns of MF
++  virtual void emitMFLiveIns(MachineFunction *MF, SMLoc Loc = SMLoc()) {}
++  // Emit LiveIns of MBB
++  virtual void emitMBBLiveIns(const MachineBasicBlock *MBB, SMLoc Loc = SMLoc()) {}
+   virtual void emitEHSymAttributes(const MCSymbol *Symbol, MCSymbol *EHSymbol);
+ 
+   /// Note in the output the specified \p Flag.
+diff --git a/llvm/lib/CodeGen/AsmPrinter/AsmPrinter.cpp b/llvm/lib/CodeGen/AsmPrinter/AsmPrinter.cpp
+index 0b1e32c87fc3..6934e99508c4 100644
+--- a/llvm/lib/CodeGen/AsmPrinter/AsmPrinter.cpp
++++ b/llvm/lib/CodeGen/AsmPrinter/AsmPrinter.cpp
+@@ -349,7 +349,9 @@ AsmPrinter::AsmPrinter(TargetMachine &tm, std::unique_ptr<MCStreamer> Streamer)
+     : MachineFunctionPass(ID), TM(tm), MAI(tm.getMCAsmInfo()),
+       OutContext(Streamer->getContext()), OutStreamer(std::move(Streamer)),
+       SM(*this) {
+-  VerboseAsm = OutStreamer->isVerboseAsm();
++  // Force to cleanup Asm outputs.
++  //VerboseAsm = OutStreamer->isVerboseAsm();
++  VerboseAsm = false;
+   DwarfUsesRelocationsAcrossSections =
+       MAI->doesDwarfUseRelocationsAcrossSections();
+ }
+diff --git a/llvm/lib/CodeGen/CMakeLists.txt b/llvm/lib/CodeGen/CMakeLists.txt
+index cac16e59a51d..d51d4d18ccb4 100644
+--- a/llvm/lib/CodeGen/CMakeLists.txt
++++ b/llvm/lib/CodeGen/CMakeLists.txt
+@@ -224,6 +224,7 @@ add_llvm_component_library(LLVMCodeGen
+   TailDuplicator.cpp
+   TargetFrameLoweringImpl.cpp
+   TargetInstrInfo.cpp
++  TargetKnownBitsInfo.cpp
+   TargetLoweringBase.cpp
+   TargetLoweringObjectFileImpl.cpp
+   TargetOptionsImpl.cpp
+diff --git a/llvm/lib/CodeGen/MachineInstr.cpp b/llvm/lib/CodeGen/MachineInstr.cpp
+index 8e0777f8438a..cf3fe368be2a 100644
+--- a/llvm/lib/CodeGen/MachineInstr.cpp
++++ b/llvm/lib/CodeGen/MachineInstr.cpp
+@@ -572,6 +572,7 @@ uint16_t MachineInstr::copyFlagsFromInstruction(const Instruction &I) {
+ 
+ void MachineInstr::copyIRFlags(const Instruction &I) {
+   Flags = copyFlagsFromInstruction(I);
++  setInstruction(&I);
+ }
+ 
+ bool MachineInstr::hasPropertyInBundle(uint64_t Mask, QueryType Type) const {
+diff --git a/llvm/lib/CodeGen/TargetKnownBitsInfo.cpp b/llvm/lib/CodeGen/TargetKnownBitsInfo.cpp
+new file mode 100644
+index 000000000000..5643a0ef03c0
+--- /dev/null
++++ b/llvm/lib/CodeGen/TargetKnownBitsInfo.cpp
+@@ -0,0 +1,33 @@
++//===-- TargetKnownBitsInfo.cpp - Implement the TargetKnownBitsInfo class -===//
++//
++// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
++// See https://llvm.org/LICENSE.txt for license information.
++// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++//
++//===----------------------------------------------------------------------===//
++//
++// This implements the TargetKnownBitsInfo class.
++//
++//===----------------------------------------------------------------------===//
++
++#include "llvm/CodeGen/TargetKnownBitsInfo.h"
++#include "llvm/Support/KnownBits.h"
++#include "llvm/ADT/DenseMap.h"
++
++using namespace llvm;
++
++void TargetKnownBitsInfo::computeKnownBitsForVReg(KnownBitsAnalysis &AA,
++    Register R, KnownBits &Known, const APInt &DemandedElts,
++    const MachineRegisterInfo &MRI, unsigned Depth) const {
++  Known.resetAll();
++}
++
++void TargetKnownBitsInfo::computeKnownBitsForPhysReg(PhysKnownBitsAnalysis &AA,
++    MachineOperand* MOP, KnownBits &Known, const APInt &DemandedElts,
++    const MachineRegisterInfo &MRI, unsigned Depth) const {
++  Known.resetAll();
++}
++
++void TargetKnownBitsInfo::getComputeKnownBitsCacheInit(
++    DenseMap<Register, KnownBits> &cacheInitMap,
++    const MachineRegisterInfo &MRI) const {}
+diff --git a/llvm/lib/MC/MCAsmStreamer.cpp b/llvm/lib/MC/MCAsmStreamer.cpp
+index 282bdb95acac..f5c1a0793570 100644
+--- a/llvm/lib/MC/MCAsmStreamer.cpp
++++ b/llvm/lib/MC/MCAsmStreamer.cpp
+@@ -9,6 +9,9 @@
+ #include "llvm/ADT/SmallString.h"
+ #include "llvm/ADT/StringExtras.h"
+ #include "llvm/ADT/Twine.h"
++#include "llvm/CodeGen/MachineBasicBlock.h"
++#include "llvm/CodeGen/MachineFunction.h"
++#include "llvm/CodeGen/MachineRegisterInfo.h"
+ #include "llvm/DebugInfo/CodeView/SymbolRecord.h"
+ #include "llvm/MC/MCAsmBackend.h"
+ #include "llvm/MC/MCAsmInfo.h"
+@@ -157,6 +160,8 @@ public:
+   }
+ 
+   void emitLabel(MCSymbol *Symbol, SMLoc Loc = SMLoc()) override;
++  void emitMFLiveIns(MachineFunction *MF, SMLoc Loc = SMLoc()) override;
++  void emitMBBLiveIns(const MachineBasicBlock *MBB, SMLoc Loc = SMLoc()) override;
+ 
+   void emitAssemblerFlag(MCAssemblerFlag Flag) override;
+   void emitLinkerOptions(ArrayRef<std::string> Options) override;
+@@ -534,6 +539,38 @@ void MCAsmStreamer::emitLabel(MCSymbol *Symbol, SMLoc Loc) {
+   EmitEOL();
+ }
+ 
++void MCAsmStreamer::emitMFLiveIns(MachineFunction *MF, SMLoc Loc) {
++  MachineRegisterInfo *RegInfo = &MF->getRegInfo();
++
++  OS << "# MFLiveIns:";
++  if (RegInfo && !RegInfo->livein_empty()) {
++    for (MachineRegisterInfo::livein_iterator
++         I = RegInfo->livein_begin(), E = RegInfo->livein_end(); I != E; ++I) {
++      OS << " ";
++      InstPrinter->printRegName(OS, I->first);
++    }
++  }
++  OS << '\n';
++}
++
++void MCAsmStreamer::emitMBBLiveIns(const MachineBasicBlock *MBB, SMLoc Loc) {
++  OS << "  ## MBBLiveIns:";
++  if (!MBB->livein_empty()) {
++    for (const auto &LI : make_range(MBB->livein_begin_dbg(), MBB->livein_end())) {
++      OS << " ";
++      InstPrinter->printRegName(OS, LI.PhysReg);
++    }
++  }
++  OS << '\n';
++
++  OS << "  ## MBBAccessed:";
++  for (unsigned i = 0, e = MBB->getAccessedRegsSize(); i < e; i++) {
++    OS << " ";
++    InstPrinter->printRegName(OS, MBB->getAccessedRegs(i));
++  }
++  OS << '\n';
++}
++
+ void MCAsmStreamer::emitLOHDirective(MCLOHType Kind, const MCLOHArgs &Args) {
+   StringRef str = MCLOHIdToName(Kind);
+ 
+@@ -2310,6 +2347,66 @@ void MCAsmStreamer::emitInstruction(const MCInst &Inst,
+   assert(getCurrentSectionOnly() &&
+          "Cannot emit contents before setting section!");
+ 
++  //** Value-level static analysis **//
++  // Dump Def Regs/Use Regs/Live Regs per instruction
++  // list live registers in comment
++  OS << "\t# Defs:";
++  for (MCPhysReg Reg : Inst.DefRegs) {
++    OS << " ";
++    InstPrinter->printRegName(OS, Reg);
++  }
++  OS << "\n";
++  OS << "\t# Uses:";
++  for (MCPhysReg Reg : Inst.UseRegs) {
++    OS << " ";
++    InstPrinter->printRegName(OS, Reg);
++  }
++  OS << "\n";
++  OS << "\t# LiveIn:";
++  for (MCPhysReg Reg : Inst.LiveRegsIn) {
++    OS << " ";
++    InstPrinter->printRegName(OS, Reg);
++  }
++  OS << "\n";
++  OS << "\t# LiveOut:";
++  for (MCPhysReg Reg : Inst.LiveRegsOut) {
++    OS << " ";
++    InstPrinter->printRegName(OS, Reg);
++  }
++  OS << "\n";
++
++  //** Bit-level static analysis **//
++  // Defs
++  for (unsigned i = 0, e = Inst.DefRegMOPs.size(); i < e; i++) {
++    MachineOperand *defMOP = Inst.DefRegMOPs[i];
++    OS << "\t# DefMOP: ";
++    InstPrinter->printRegName(OS, defMOP->getReg());
++    OS << ": ";
++    assert(Inst.RIMap.find(defMOP) != Inst.RIMap.end()
++           && " defMOP not found in RIMap");
++    SmallVector<std::pair<uint8_t, uint32_t>, 4> defRIMap = Inst.RIMap.lookup(defMOP);
++    for (unsigned j = 0, je = defRIMap.size(); j < je; j++) {
++      assert(defRIMap[j].first == j && "Incomplete RIMapf or defMOP");
++      OS << defRIMap[j].second << " ";
++    }
++    OS << "\n";
++  }
++  // Uses
++  for (unsigned i = 0, e = Inst.UseRegMOPs.size(); i < e; i++) {
++    MachineOperand *useMOP = Inst.UseRegMOPs[i];
++    OS << "\t# UseMOP: ";
++    InstPrinter->printRegName(OS, useMOP->getReg());
++    OS << ": ";
++    assert(Inst.RIMap.find(useMOP) != Inst.RIMap.end()
++           && " useMOP not found in RIMap");
++    SmallVector<std::pair<uint8_t, uint32_t>, 4> useRIMap = Inst.RIMap.lookup(useMOP);
++    for (unsigned j = 0, je = useRIMap.size(); j < je; j++) {
++      assert(useRIMap[j].first == j && "Incomplete RIMapf or defMOP");
++      OS << useRIMap[j].second << " ";
++    }
++    OS << "\n";
++  }
++
+   if (!MAI->usesDwarfFileAndLocDirectives())
+     // Now that a machine instruction has been assembled into this section, make
+     // a line entry for any .loc directive that has been seen.
+@@ -2329,11 +2426,15 @@ void MCAsmStreamer::emitInstruction(const MCInst &Inst,
+   else
+     InstPrinter->printInst(&Inst, 0, "", STI, OS);
+ 
++  // Disable any other comments than live registers.
++  /*
+   StringRef Comments = CommentToEmit;
+   if (Comments.size() && Comments.back() != '\n')
+     getCommentOS() << "\n";
+ 
+   EmitEOL();
++  */
++  OS << "\n";
+ }
+ 
+ void MCAsmStreamer::emitPseudoProbe(
+diff --git a/llvm/lib/MC/MCMachOStreamer.cpp b/llvm/lib/MC/MCMachOStreamer.cpp
+index 699742f96db8..11aee16a91d8 100644
+--- a/llvm/lib/MC/MCMachOStreamer.cpp
++++ b/llvm/lib/MC/MCMachOStreamer.cpp
+@@ -88,6 +88,8 @@ public:
+ 
+   void changeSection(MCSection *Sect, const MCExpr *Subsect) override;
+   void emitLabel(MCSymbol *Symbol, SMLoc Loc = SMLoc()) override;
++  void emitMFLiveIns(MachineFunction *MF, SMLoc Loc = SMLoc()) override {};
++  void emitMBBLiveIns(const MachineBasicBlock *MBB, SMLoc Loc = SMLoc()) override {};
+   void emitAssignment(MCSymbol *Symbol, const MCExpr *Value) override;
+   void emitEHSymAttributes(const MCSymbol *Symbol, MCSymbol *EHSymbol) override;
+   void emitAssemblerFlag(MCAssemblerFlag Flag) override;
+diff --git a/llvm/utils/TableGen/PseudoLoweringEmitter.cpp b/llvm/utils/TableGen/PseudoLoweringEmitter.cpp
+index 6a1e1332d767..4dc711f38a28 100644
+--- a/llvm/utils/TableGen/PseudoLoweringEmitter.cpp
++++ b/llvm/utils/TableGen/PseudoLoweringEmitter.cpp
+@@ -287,6 +287,19 @@ void PseudoLoweringEmitter::emitLoweringEmitter(raw_ostream &o) {
+           << "      if (lowerOperand(MI->getOperand(i), MCOp))\n"
+           << "        TmpInst.addOperand(MCOp);\n";
+       }
++      // copy the AccessedRegs
++      o << "    for (MCPhysReg Reg : MI->DefRegs)\n"
++        << "      TmpInst.DefRegs.push_back(Reg);\n";
++      o << "\n";
++      o << "    for (MCPhysReg Reg : MI->UseRegs)\n"
++        << "      TmpInst.UseRegs.push_back(Reg);\n";
++      o << "\n";
++      o << "    for (MCPhysReg Reg : MI->LiveRegsIn)\n"
++        << "      TmpInst.LiveRegsIn.push_back(Reg);\n";
++      o << "\n";
++      o << "    for (MCPhysReg Reg : MI->LiveRegsOut)\n"
++        << "      TmpInst.LiveRegsOut.push_back(Reg);\n";
++      o << "\n";
+       o << "    EmitToStreamer(OutStreamer, TmpInst);\n"
+         << "    break;\n"
+         << "  }\n";
+-- 
+2.25.1
+

@@ -1,0 +1,492 @@
+From 7563313f251d3ccb990ac6022625af43d6d0b116 Mon Sep 17 00:00:00 2001
+From: Yousun Ko <yousun.ko@yonsei.ac.kr>
+Date: Mon, 21 Aug 2023 17:06:41 +0900
+Subject: [PATCH 4/7] [BEC][RISCV] Add post-ra KnownBits analysis rules for
+ RISC-V
+
+---
+ llvm/lib/Target/RISCV/CMakeLists.txt         |   2 +
+ llvm/lib/Target/RISCV/RISCVKnownBitsInfo.cpp | 347 +++++++++++++++++++
+ llvm/lib/Target/RISCV/RISCVKnownBitsInfo.h   |  50 +++
+ llvm/lib/Target/RISCV/RISCVSubtarget.cpp     |   3 +-
+ llvm/lib/Target/RISCV/RISCVSubtarget.h       |   5 +
+ 5 files changed, 406 insertions(+), 1 deletion(-)
+ create mode 100644 llvm/lib/Target/RISCV/RISCVKnownBitsInfo.cpp
+ create mode 100644 llvm/lib/Target/RISCV/RISCVKnownBitsInfo.h
+
+diff --git a/llvm/lib/Target/RISCV/CMakeLists.txt b/llvm/lib/Target/RISCV/CMakeLists.txt
+index f909e0017e2b..0172783cdd7b 100644
+--- a/llvm/lib/Target/RISCV/CMakeLists.txt
++++ b/llvm/lib/Target/RISCV/CMakeLists.txt
+@@ -47,6 +47,8 @@ add_llvm_target(RISCVCodeGen
+   GISel/RISCVLegalizerInfo.cpp
+   GISel/RISCVRegisterBankInfo.cpp
+ 
++  RISCVKnownBitsInfo.cpp
++
+   LINK_COMPONENTS
+   Analysis
+   AsmPrinter
+diff --git a/llvm/lib/Target/RISCV/RISCVKnownBitsInfo.cpp b/llvm/lib/Target/RISCV/RISCVKnownBitsInfo.cpp
+new file mode 100644
+index 000000000000..7f0ce463838c
+--- /dev/null
++++ b/llvm/lib/Target/RISCV/RISCVKnownBitsInfo.cpp
+@@ -0,0 +1,347 @@
++//===-- RISCVKnownBitsInfo.cpp - RISCV KnownBitsInfo Impl -----------------===//
++//
++// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
++// See https://llvm.org/LICENSE.txt for license information.
++// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++//
++//===----------------------------------------------------------------------===//
++//
++// This file defines the interfaces that RISCV uses for KnownBitsAnalysis
++// analysis.
++//
++//===----------------------------------------------------------------------===//
++
++#include "RISCVKnownBitsInfo.h"
++#include "RISCV.h"
++#include "RISCVSubtarget.h"
++#include "RISCVTargetMachine.h"
++#include "llvm/CodeGen/PhysKnownBitsAnalysis.h"
++#include "llvm/Support/KnownBits.h"
++
++using namespace llvm;
++
++#define LOCAL_LLVM_DEBUG(x){}
++#define DEBUG_TYPE "riscv-knownbitsinfo"
++
++RISCVKnownBitsInfo::RISCVKnownBitsInfo(const TargetMachine &TM,
++                                       const RISCVSubtarget &STI)
++    : TargetKnownBitsInfo(TM), Subtarget(STI), TRI(*STI.getRegisterInfo()) {}
++
++void RISCVKnownBitsInfo::computeKnownBitsForPhysReg(PhysKnownBitsAnalysis &AA,
++    MachineOperand* MOP, KnownBits &Known, const APInt &DemandedElts,
++    const MachineRegisterInfo &MRI, unsigned Depth) const {
++  unsigned BitWidth = TRI.getRegSizeInBits(MOP->getReg(), MRI);
++
++  MachineInstr &defMI = *MOP->getParent();
++  unsigned Opcode = defMI.getOpcode();
++  KnownBits Known2;
++
++  // Set the KnownBits for the src regs.
++  switch (Opcode) {
++  default:
++    break;
++  case TargetOpcode::COPY: {
++    if (defMI.getOperand(1).isReg())
++      AA.computeKnownBitsImpl(&defMI.getOperand(1), Known, DemandedElts, Depth);
++    else if (defMI.getOperand(1).isImm())
++      getKnownBitsImm(defMI, 1, BitWidth, Known);
++    else
++      Known = KnownBits(BitWidth);
++    break;
++  }
++  case RISCV::SUB:
++  case RISCV::XOR:
++  case RISCV::ADD:
++  case RISCV::AND:
++  case RISCV::OR:
++  case RISCV::MUL:
++  case RISCV::SLT:
++  case RISCV::SLTU:
++  case RISCV::SLL:
++  case RISCV::SRL:
++  case RISCV::SRA: {
++    if (defMI.getOperand(2).isReg())
++      AA.computeKnownBitsImpl(&defMI.getOperand(2), Known2, DemandedElts,
++                           Depth + 1);
++    else
++      Known2 = KnownBits(BitWidth);
++
++    if (defMI.getOperand(1).isReg())
++      AA.computeKnownBitsImpl(&defMI.getOperand(1), Known, DemandedElts,
++                           Depth + 1);
++    else
++      Known = KnownBits(BitWidth);
++    break;
++  }
++  case RISCV::XORI:
++  case RISCV::ADDI:
++  case RISCV::ANDI:
++  case RISCV::ORI:
++  case RISCV::SLTI:
++  case RISCV::SLTIU:
++  case RISCV::SLLI:
++  case RISCV::SRLI:
++  case RISCV::SRAI: {
++    if (defMI.getOperand(1).isReg())
++      AA.computeKnownBitsImpl(&defMI.getOperand(1), Known, DemandedElts,
++                           Depth + 1);
++    else
++      Known = KnownBits(BitWidth);
++    getKnownBitsImm(defMI, 2, BitWidth, Known2);
++    break;
++  }
++  }
++
++  // In case of binary operators, compute KnownBits of the right-hand operand
++  // first, as it seems the analyzer canonicalize simpler expressions to the
++  // right-hand operand.
++  switch (Opcode) {
++  default:
++    LOCAL_LLVM_DEBUG(dbgs() << "RISCVKnownBitsInfo: Unidentified Opcode\n";
++               defMI.dump());
++    break;
++  case RISCV::SUB: {
++    Known = KnownBits::computeForAddSub(/*Add*/ false, /*NSW*/ false, Known,
++                                        Known2);
++    break;
++  }
++  case RISCV::XOR: {
++    Known ^= Known2;
++    break;
++  }
++  case RISCV::XORI: {
++    Known ^= Known2;
++    break;
++  }
++  case RISCV::ADD: {
++    Known =
++        KnownBits::computeForAddSub(/*Add*/ true, /*NSW*/ false, Known, Known2);
++    break;
++  }
++  case RISCV::ADDI: {
++    Known =
++        KnownBits::computeForAddSub(/*Add*/ true, /*NSW*/ false, Known, Known2);
++    break;
++  }
++  case RISCV::AND: {
++    Known &= Known2;
++    break;
++  }
++  case RISCV::ANDI: {
++    Known &= Known2;
++    break;
++  }
++  case RISCV::OR: {
++    Known |= Known2;
++    break;
++  }
++  case RISCV::ORI: {
++    Known |= Known2;
++    break;
++  }
++  case RISCV::MUL: {
++    Known = KnownBits::mul(Known, Known2);
++    break;
++  }
++  case RISCV::SLT: {
++    if (KnownBits::slt(Known, Known2))
++      Known = KnownBits::makeConstant(APInt(BitWidth, 1));
++    else if (KnownBits::sge(Known, Known2))
++      Known = KnownBits::makeConstant(APInt(BitWidth, 0));
++    else {
++      Known.setAllZero();
++      Known.setUnknown(0);
++    }
++    break;
++  }
++  case RISCV::SLTU: {
++    if (KnownBits::ult(Known, Known2))
++      Known = KnownBits::makeConstant(APInt(BitWidth, 1));
++    else if (KnownBits::uge(Known, Known2))
++      Known = KnownBits::makeConstant(APInt(BitWidth, 0));
++    else {
++      Known.setAllZero();
++      Known.setUnknown(0);
++    }
++    break;
++  }
++  case RISCV::SLTI: {
++    if (KnownBits::slt(Known, Known2))
++      Known = KnownBits::makeConstant(APInt(BitWidth, 1));
++    else if (KnownBits::sge(Known, Known2))
++      Known = KnownBits::makeConstant(APInt(BitWidth, 0));
++    else {
++      Known.setAllZero();
++      Known.setUnknown(0);
++    }
++    break;
++  }
++  case RISCV::SLTIU: {
++    if (KnownBits::ult(Known, Known2))
++      Known = KnownBits::makeConstant(APInt(BitWidth, 1));
++    else if (KnownBits::uge(Known, Known2))
++      Known = KnownBits::makeConstant(APInt(BitWidth, 0));
++    else {
++      Known.setAllZero();
++      Known.setUnknown(0);
++    }
++    break;
++  }
++  case RISCV::SLL: {
++    Known = KnownBits::shl(Known, Known2);
++    break;
++  }
++  case RISCV::SLLI: {
++    Known = KnownBits::shl(Known, Known2);
++    break;
++  }
++  case RISCV::SRL: {
++    Known = KnownBits::lshr(Known, Known2);
++    break;
++  }
++  case RISCV::SRLI: {
++    Known = KnownBits::lshr(Known, Known2);
++    break;
++  }
++  case RISCV::SRA: {
++    Known = KnownBits::ashr(Known, Known2);
++    break;
++  }
++  case RISCV::SRAI: {
++    Known = KnownBits::ashr(Known, Known2);
++    break;
++  }
++  case RISCV::LUI: {
++    if (defMI.getOperand(1).isImm()) {
++      int64_t C = defMI.getOperand(1).getImm() << 12;
++      APInt APC = APInt(BitWidth, std::abs(C));
++      if (C  < 0)
++        APC.negate();
++      Known = KnownBits::makeConstant(APC);
++    } else {
++      LOCAL_LLVM_DEBUG(dbgs() << "++ Not an imm: "; defMI.getOperand(1).dump());
++      Known = KnownBits(BitWidth);
++      Known.resetAll();
++    }
++    break;
++  }
++  case RISCV::PseudoLI: {
++    getKnownBitsImm(defMI, 1, BitWidth, Known);
++    break;
++  }
++  // mem load instructions.
++  case RISCV::LD:
++  case RISCV::LB:
++  case RISCV::LH:
++  case RISCV::LW:
++  case RISCV::LBU:
++  case RISCV::LHU:
++  case RISCV::LWU:
++  case RISCV::PseudoLB:
++  case RISCV::PseudoLBU:
++  case RISCV::PseudoLH:
++  case RISCV::PseudoLHU:
++  case RISCV::PseudoLW:
++  {
++    // All bits unknown.
++    Known.resetAll();
++    break;
++  }
++  case RISCV::SB:
++  case RISCV::SH:
++  case RISCV::SW:
++  case RISCV::SD:
++  case RISCV::PseudoSB:
++  case RISCV::PseudoSH:
++  case RISCV::PseudoSW:
++  {
++    break;
++  }
++  // Branch instructions.
++  case RISCV::BEQ:
++  case RISCV::BNE:
++  case RISCV::BGE:
++  case RISCV::BGEU:
++  case RISCV::BLT:
++  case RISCV::BLTU:
++  {
++    break;
++  }
++  // Instructions with no data update.
++  case RISCV::URET:
++  case RISCV::SRET:
++  case RISCV::MRET:
++  case RISCV::DRET:
++  {
++    break;
++  }
++  // FIXME: could be improved?
++  // FIXME: are these reachable?
++  case RISCV::AUIPC:
++  case RISCV::PseudoLLA:
++  case RISCV::PseudoLA:
++  case RISCV::PseudoLA_TLS_IE:
++  case RISCV::PseudoLA_TLS_GD:
++  case RISCV::JAL:
++  case RISCV::JALR:
++  {
++    // All bits unknown.
++    Known.resetAll();
++    break;
++  }
++  // FIXME: could be improved?
++  case RISCV::CSRRW:
++  case RISCV::CSRRS:
++  case RISCV::CSRRC:
++  case RISCV::CSRRWI:
++  case RISCV::CSRRSI:
++  case RISCV::CSRRCI:
++  {
++    // All bits unknown.
++    Known.resetAll();
++    break;
++  }
++  // FIXME: 64-bit instrs
++  case RISCV::ADDIW:
++  case RISCV::SLLIW:
++  case RISCV::SRLIW:
++  case RISCV::SRAIW:
++  case RISCV::ADDW:
++  case RISCV::SUBW:
++  case RISCV::SLLW:
++  case RISCV::SRLW:
++  case RISCV::SRAW:
++  case RISCV::PseudoLWU:
++  case RISCV::PseudoLD:
++  case RISCV::PseudoSD:
++  {
++    // All bits unknown.
++    Known.resetAll();
++    break;
++  }
++  }
++}
++
++void RISCVKnownBitsInfo::getComputeKnownBitsCacheInit(
++    DenseMap<Register, KnownBits> &cacheInitMap,
++    const MachineRegisterInfo &MRI) const {
++  KnownBits K = KnownBits(TRI.getRegSizeInBits(RISCV::X0, MRI));
++  K.setAllZero();
++  cacheInitMap[RISCV::X0] = K;
++}
++
++void RISCVKnownBitsInfo::getKnownBitsImm(const MachineInstr &MI,
++    unsigned OpIdx, unsigned BitWidth, KnownBits &Known) const {
++  if (!MI.getOperand(OpIdx).isImm()) {
++    LOCAL_LLVM_DEBUG(dbgs() << "RISCVKnownBitsInfo::Not an imm: ";
++               MI.getOperand(OpIdx).dump());
++    Known = KnownBits(BitWidth);
++    Known.resetAll();
++    return;
++  }
++  int64_t C = MI.getOperand(OpIdx).getImm();
++  APInt APC = APInt(BitWidth, std::abs(C));
++  if (C  < 0)
++    APC.negate();
++  Known = KnownBits::makeConstant(APC);
++}
+diff --git a/llvm/lib/Target/RISCV/RISCVKnownBitsInfo.h b/llvm/lib/Target/RISCV/RISCVKnownBitsInfo.h
+new file mode 100644
+index 000000000000..2b62f6a0a413
+--- /dev/null
++++ b/llvm/lib/Target/RISCV/RISCVKnownBitsInfo.h
+@@ -0,0 +1,50 @@
++//==-- RISCVKnownBitsInfo.h - RISCV KnownBitsAnalysis Interface -*- C++ -*--==//
++//
++// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
++// See https://llvm.org/LICENSE.txt for license information.
++// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++//
++//===----------------------------------------------------------------------===//
++//
++// This file contains KnownBits analyses for virtual and physical registers.
++//   - computeKnownBitsForVReg: KnownBits analysis for virtual registers
++//   - computeKnownBitsForPhysReg: KnownBits analysis for physical registers
++//
++//===----------------------------------------------------------------------===//
++
++#ifndef LLVM_LIB_TARGET_RISCV_RISCVKNOWNBITSINFO_H
++#define LLVM_LIB_TARGET_RISCV_RISCVKNOWNBITSINFO_H
++
++#include "RISCV.h"
++#include "llvm/CodeGen/TargetKnownBitsInfo.h"
++
++namespace llvm {
++
++class RISCVSubtarget;
++class RISCVRegisterInfo;
++
++class RISCVKnownBitsInfo: public TargetKnownBitsInfo {
++  const RISCVSubtarget &Subtarget;
++  const RISCVRegisterInfo &TRI;
++
++public:
++  explicit RISCVKnownBitsInfo(const TargetMachine &TM,
++                              const RISCVSubtarget &STI);
++
++  const RISCVSubtarget &getSubtarget() const { return Subtarget; }
++
++  void computeKnownBitsForPhysReg(PhysKnownBitsAnalysis &AA,
++                               MachineOperand* MOP, KnownBits &Known,
++                               const APInt &DemandedElts,
++                               const MachineRegisterInfo &MRI,
++                               unsigned Depth = 0) const override;
++
++  void getComputeKnownBitsCacheInit(DenseMap<Register, KnownBits> &cacheInitMap, const MachineRegisterInfo &MRI) const override;
++
++  void getKnownBitsImm(const MachineInstr &MI, unsigned OpIdx, unsigned BitWidth,
++                       KnownBits &Known) const;
++};
++
++} // end namespace llvm
++
++#endif
+diff --git a/llvm/lib/Target/RISCV/RISCVSubtarget.cpp b/llvm/lib/Target/RISCV/RISCVSubtarget.cpp
+index d0bb4634d03d..3a5adfececb5 100644
+--- a/llvm/lib/Target/RISCV/RISCVSubtarget.cpp
++++ b/llvm/lib/Target/RISCV/RISCVSubtarget.cpp
+@@ -18,6 +18,7 @@
+ #include "GISel/RISCVCallLowering.h"
+ #include "GISel/RISCVLegalizerInfo.h"
+ #include "GISel/RISCVRegisterBankInfo.h"
++#include "RISCVKnownBitsInfo.h"
+ #include "llvm/MC/TargetRegistry.h"
+ #include "llvm/Support/ErrorHandling.h"
+ 
+@@ -82,7 +83,7 @@ RISCVSubtarget::RISCVSubtarget(const Triple &TT, StringRef CPU,
+       RVVVectorBitsMin(RVVVectorBitsMin), RVVVectorBitsMax(RVVVectorBitsMax),
+       FrameLowering(
+           initializeSubtargetDependencies(TT, CPU, TuneCPU, FS, ABIName)),
+-      InstrInfo(*this), RegInfo(getHwMode()), TLInfo(TM, *this) {
++      InstrInfo(*this), RegInfo(getHwMode()), TLInfo(TM, *this), TKBInfo(TM, *this) {
+   if (RISCV::isX18ReservedByDefault(TT))
+     UserReservedRegister.set(RISCV::X18);
+ 
+diff --git a/llvm/lib/Target/RISCV/RISCVSubtarget.h b/llvm/lib/Target/RISCV/RISCVSubtarget.h
+index 290c7b03ea81..230e2e371d77 100644
+--- a/llvm/lib/Target/RISCV/RISCVSubtarget.h
++++ b/llvm/lib/Target/RISCV/RISCVSubtarget.h
+@@ -17,6 +17,7 @@
+ #include "RISCVFrameLowering.h"
+ #include "RISCVISelLowering.h"
+ #include "RISCVInstrInfo.h"
++#include "RISCVKnownBitsInfo.h"
+ #include "llvm/CodeGen/GlobalISel/CallLowering.h"
+ #include "llvm/CodeGen/GlobalISel/InstructionSelector.h"
+ #include "llvm/CodeGen/GlobalISel/LegalizerInfo.h"
+@@ -60,6 +61,7 @@ private:
+   RISCVInstrInfo InstrInfo;
+   RISCVRegisterInfo RegInfo;
+   RISCVTargetLowering TLInfo;
++  RISCVKnownBitsInfo TKBInfo;
+   SelectionDAGTargetInfo TSInfo;
+ 
+   /// Initializes using the passed in CPU and feature strings so that we can
+@@ -90,6 +92,9 @@ public:
+   const RISCVTargetLowering *getTargetLowering() const override {
+     return &TLInfo;
+   }
++  const RISCVKnownBitsInfo *getTargetKnownBitsInfo() const override {
++    return &TKBInfo;
++  }
+   const SelectionDAGTargetInfo *getSelectionDAGInfo() const override {
+     return &TSInfo;
+   }
+-- 
+2.25.1
+

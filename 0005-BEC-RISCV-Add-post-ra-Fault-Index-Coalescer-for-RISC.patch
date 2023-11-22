@@ -1,0 +1,1992 @@
+From 308c026e5592818dc5c2e6a02b2be3d32b48634d Mon Sep 17 00:00:00 2001
+From: "yousun.ko@yonsei.ac.kr" <yousun.ko@yonsei.ac.kr>
+Date: Sat, 18 Nov 2023 00:40:19 +0900
+Subject: [PATCH 5/7] [BEC][RISCV] Add post-ra Fault Index Coalescer for RISC-V
+
+---
+ llvm/lib/Target/RISCV/CMakeLists.txt          |    1 +
+ llvm/lib/Target/RISCV/RISCV.h                 |    3 +
+ .../RISCV/RISCVPostRAFaultIndexCoalescer.cpp  | 1911 +++++++++++++++++
+ llvm/lib/Target/RISCV/RISCVTargetMachine.cpp  |    8 +-
+ 4 files changed, 1922 insertions(+), 1 deletion(-)
+ create mode 100644 llvm/lib/Target/RISCV/RISCVPostRAFaultIndexCoalescer.cpp
+
+diff --git a/llvm/lib/Target/RISCV/CMakeLists.txt b/llvm/lib/Target/RISCV/CMakeLists.txt
+index 0172783cdd7b..89d0851e21ff 100644
+--- a/llvm/lib/Target/RISCV/CMakeLists.txt
++++ b/llvm/lib/Target/RISCV/CMakeLists.txt
+@@ -48,6 +48,7 @@ add_llvm_target(RISCVCodeGen
+   GISel/RISCVRegisterBankInfo.cpp
+ 
+   RISCVKnownBitsInfo.cpp
++  RISCVPostRAFaultIndexCoalescer.cpp
+ 
+   LINK_COMPONENTS
+   Analysis
+diff --git a/llvm/lib/Target/RISCV/RISCV.h b/llvm/lib/Target/RISCV/RISCV.h
+index c42fb070aade..6344f1ec7cc6 100644
+--- a/llvm/lib/Target/RISCV/RISCV.h
++++ b/llvm/lib/Target/RISCV/RISCV.h
+@@ -71,6 +71,9 @@ void initializeRISCVInsertVSETVLIPass(PassRegistry &);
+ FunctionPass *createRISCVRedundantCopyEliminationPass();
+ void initializeRISCVRedundantCopyEliminationPass(PassRegistry &);
+ 
++FunctionPass *createRISCVPostRAFaultIndexCoalescerPass();
++void initializeRISCVPostRAFaultIndexCoalescerPass(PassRegistry &);
++
+ InstructionSelector *createRISCVInstructionSelector(const RISCVTargetMachine &,
+                                                     RISCVSubtarget &,
+                                                     RISCVRegisterBankInfo &);
+diff --git a/llvm/lib/Target/RISCV/RISCVPostRAFaultIndexCoalescer.cpp b/llvm/lib/Target/RISCV/RISCVPostRAFaultIndexCoalescer.cpp
+new file mode 100644
+index 000000000000..c4136b90fcec
+--- /dev/null
++++ b/llvm/lib/Target/RISCV/RISCVPostRAFaultIndexCoalescer.cpp
+@@ -0,0 +1,1911 @@
++//==--- RISCVPostRAFaultIndexCoalescer.cpp - Fault Index Coalescer ---------==//
++//
++//
++// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
++// See https://llvm.org/LICENSE.txt for license information.
++// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++//
++//===----------------------------------------------------------------------===//
++// Coalesce Fault Index based on KnownBits in SSA form.
++//
++//===----------------------------------------------------------------------===//
++
++#include "RISCV.h"
++
++#include "llvm/CodeGen/MachineRegisterInfo.h"
++#include "llvm/CodeGen/PhysKnownBitsAnalysis.h"
++#include "llvm/CodeGen/GlobalISel/GISelKnownBits.h"
++#include "llvm/CodeGen/MachineBlockFrequencyInfo.h"
++#include "llvm/CodeGen/MachineBranchProbabilityInfo.h"
++#include "llvm/CodeGen/MachineLoopInfo.h"
++#include "llvm/Support/BlockFrequency.h"
++#include <optional>
++
++using namespace llvm;
++
++#define DEBUG_TYPE "riscv-postra-faultindex-coalescer"
++
++#define DUMP_LLVM_DEBUG(x){}
++#define DUMP_FINAL_FI_LLVM_DEBUG(x){}
++#define STAT_LLVM_DEBUG(x){}
++#define KB_LLVM_DEBUG(x){}
++#define PATH_LLVM_DEBUG(x){}
++#define ACCESS_LLVM_DEBUG(x){}
++#define DEF_LLVM_DEBUG(x){}
++
++#define RISCV_POSTRA_FAULTINDEX_COALESCER_NAME "RISCV post-ra Fault Index Coalescer Pass"
++
++namespace {
++class RISCVPostRAFaultIndexCoalescer : public MachineFunctionPass {
++public:
++  static char ID;
++
++  RISCVPostRAFaultIndexCoalescer() : MachineFunctionPass(ID) {
++    initializeRISCVPostRAFaultIndexCoalescerPass(*PassRegistry::getPassRegistry());
++  }
++
++  void getAnalysisUsage(AnalysisUsage &AU) const override;
++  bool runOnMachineFunction(MachineFunction &MF) override;
++  StringRef getPassName() const override { return RISCV_POSTRA_FAULTINDEX_COALESCER_NAME; }
++
++private:
++  MachineRegisterInfo *MRI = nullptr;
++  const TargetRegisterInfo *TRI = nullptr;
++  PhysKnownBitsAnalysis *PKBA = nullptr;
++  MachineLoopInfo *MLI = nullptr;
++
++  // Containers for KnownBits
++  DenseMap<MachineOperand*, KnownBits> KnownBitsMap;
++
++  //
++  // Types for fault sites
++  //
++  using RegMapTy = DenseMap<Register, MachineOperand*>;
++  using FaultSiteMITy = DenseMap<MachineInstr*, RegMapTy>;
++  using FaultSiteMBBTy = DenseMap<MachineBasicBlock*, RegMapTy>;
++
++  FaultSiteMITy FaultSites;
++  FaultSiteMBBTy FaultSitesMBBLiveIns;
++  FaultSiteMBBTy FaultSitesMBBLiveOuts;
++
++  //
++  // Containers for quantitative numbers
++  DenseMap<MachineBasicBlock*, unsigned> FaultSitesMap;
++  DenseMap<MachineBasicBlock*, unsigned> DeadFaultSitesMap;
++  DenseMap<MachineBasicBlock*, unsigned> FISpaceMap;
++  DenseMap<MachineBasicBlock*, unsigned> FIRunsMap;
++  DenseMap<MachineBasicBlock*, unsigned> DeadFIRunsMap;
++
++  //
++  // FIRes types
++  //
++  using FIResTy = SmallVector<std::pair<uint8_t, uint32_t>, 4>;
++  using FIResMapTy = DenseMap<MachineOperand*, FIResTy>;
++  using FIResLstTy = SmallVector<std::pair<MachineOperand*, FIResTy>, 4>;
++  using FICandMapTy = DenseMap<MachineOperand*, FIResMapTy>;
++  using AccMapTy = DenseMap<MachineOperand*, SmallVector<MachineOperand*, 4>>;
++
++  //
++  // Containers for qualitative info
++  //   FI Result Index:
++  //     0: correct (fault injected is dead)
++  //     1: anonymous result index 0
++  //     2: anonymous result index 1
++  //        ...
++  FIResMapTy FIResMap;
++
++  // FICandMap indicates how to group FI sites of an MOP.
++  // Values of FICandMap coincide with the values of the FIResMap.
++  // Each MOP may have more than multiple candidates if the MOP is used in
++  // different MOPs.
++  FICandMapTy FICandMap;
++
++  // Lists of next access MOPs for each MOP.
++  AccMapTy NextAccMap;
++  // Lists of prev access MOPs for each MOP.
++  AccMapTy PrevAccMap;
++
++  // Independent paths from the entry.
++  SmallVector<SmallVector<MachineBasicBlock*, 4>, 4> pIndepPaths;
++
++  void init(MachineFunction &MF) {
++    FISpaceMap.clear();
++    FIRunsMap.clear();
++    DeadFIRunsMap.clear();
++
++    FIResMap.clear();
++    FICandMap.clear();
++
++    NextAccMap.clear();
++    PrevAccMap.clear();
++
++    MRI->DefMOPMap.clear();
++
++    // Init independent paths.
++    for (unsigned i = 0, ie = pIndepPaths.size(); i < ie; i++) {
++      pIndepPaths[i].clear();
++    }
++    pIndepPaths.clear();
++
++    SmallVector<MachineBasicBlock *, 4> indep_path;
++    indep_path.push_back(&MF.front());
++    collectIndependentPaths(&pIndepPaths, indep_path, &MF.front());
++    PATH_LLVM_DEBUG(dump_paths(pIndepPaths));
++  }
++
++  // Add missing kill flags if exists. Kill flags must be correct to retrieve
++  // Next|Prev access relations of regs.
++  void computeKnownBits(MachineFunction &MF);
++  void computeBranchFreq(MachineFunction &MF);
++  void computeAccessMaps(MachineFunction &MF);
++  void computeDefMIMap(MachineFunction &MF);
++  // Initialize FI runs required when injecting faults after any read/writes.
++  // Assign own FI Result Index for each bit of regs.
++  void initFIResultMap(MachineFunction &MF);
++  // Initialize FICandMap values with the FIResMap.
++  void initFICandMap(MachineFunction &MF);
++  // Compute FICandMap of Uses by processing each MI.
++  // Return true if new FICandMap entry exists to be processed.
++  bool computeFICandMap(MachineFunction &MF);
++  // Combine and apply new FICandMap entries to FIResMap of Defs.
++  // Return true if any FIResMap entries are modified.
++  bool updateFIResultMap(MachineFunction &MF);
++  // Set the def-use relations of registers.
++  // Set liveness information of the registers.
++  void getNextAccs(MachineOperand *MOP, SmallVector<MachineOperand*, 4> &nextAccs);
++  bool hasOnlyOnePrevAcc(MachineOperand *MOP);
++
++  // Calculate total number of fault sites.
++  // Baseline to compute the prog vulnerability.
++  void calculateFaultSiteSpace(MachineFunction &MF);
++  // Calculate the size of the access-aware FI space before bit-level prunning.
++  // Baseline to compute the prunning rate.
++  void calculateFISpace(MachineFunction &MF);
++  // Calculate the number of FI runs required (irrespective of pruning),
++  // and the number of dead FI runs (i.e., FIResIdx == 0)
++  void calculateFIRuns(MachineFunction &MF);
++
++  // Update MachineInstrs with FIResMap
++  void updateMIs(MachineFunction &MF);
++
++  //
++  // Helper Functions
++  //
++  // Helper functions for KnownBits.
++  void setKnownBitsMap(MachineOperand *MOP, KnownBits KB);
++  KnownBits getKnownBitsMap(MachineOperand *MOP);
++  void getKnownBitsImm(MachineInstr &MI, unsigned OpIdx, unsigned BitWidth, KnownBits &Known);
++  // Helper functions for FIResMap.
++  bool setFIRes(FIResTy &FIRes, uint8_t BitPos, uint32_t FIResIdx);
++  bool setFIResMap(MachineOperand* MOP, uint8_t BitPos, uint32_t FIResIdx);
++  bool setFIResMapDead(MachineOperand* MOP, uint8_t BitPos);
++  uint32_t getFIRes(FIResTy &FIRes, uint8_t BitPos);
++  uint32_t getFIResMap(MachineOperand* MOP, uint8_t BitPos);
++
++  // Helper functions for FISpaceMap
++  void addFaultSite(MachineInstr *MI, Register Reg, MachineOperand* MOP);
++  // Not necessary in the current implementation.
++  void removeFaultSite(MachineInstr *MI, Register Reg);
++
++  // Helper functions for FICandMap.
++  bool setFICandMap(MachineOperand* MOP, MachineOperand* UseMOP, uint8_t BitPos, uint32_t FIResIdx);
++  bool setFICandMapDead(MachineOperand* MOP, MachineOperand* UseMOP, uint8_t BitPos);
++  bool setFICandMapAllPrevAcc(MachineOperand* UseMOP, uint8_t BitPos, uint32_t FIResIdx);
++  bool setFICandMapAllPrevAccDead(MachineOperand* UseMOP, uint8_t BitPos);
++  // FICand is copied within the operand itself.
++  bool copyFICandMapAllPrevAcc(MachineOperand* UseMOP, uint8_t fromBitPos, uint8_t toBitPos);
++
++  uint32_t getFICandMap(MachineOperand* MOP, MachineOperand* UseMOP, uint8_t BitPos);
++
++  bool isLiveOutMBB(MachineOperand *MOP);
++
++  //
++  // Dump Functions
++  //
++  void dumpFISpace(MachineFunction &MF, unsigned step);
++  void dumpKnownBits(MachineFunction &MF);
++  void dumpBranchFreq(MachineFunction &MF);
++  void dumpAccessMaps(MachineFunction &MF);
++  void dumpDefMOPMap(MachineFunction &MF);
++  void dumpFIResMap(MachineFunction &MF);
++  void dumpFICandMap(MachineFunction &MF);
++  void dumpFaultSites(MachineFunction &MF);
++
++  //
++  // Independent Paths
++  //
++  // Collect all independent paths recursively.
++  void collectIndependentPaths(
++                  SmallVector<SmallVector<MachineBasicBlock *, 4>, 4> *Paths,
++                  SmallVector<MachineBasicBlock *, 4> curPath,
++                  MachineBasicBlock* startMBB,
++                  MachineBasicBlock* endMBB = nullptr);
++  // Helper functions.
++  void deepCopyMap(RegMapTy &destMap, RegMapTy srcMap);
++  bool isMOPInList(MachineOperand *MOP,
++                  SmallVector<MachineOperand*, 4> list);
++  bool isMIInList(MachineInstr *MI,
++                  SmallVector<MachineInstr*, 4> list);
++  bool isMBBInList(MachineBasicBlock *MBB,
++                   SmallVector<MachineBasicBlock*, 4> list);
++  bool isMBBInMap(MachineBasicBlock *MBB, FaultSiteMBBTy Map);
++  bool isRegInMap(Register Reg, RegMapTy Map);
++
++  void dump_paths(SmallVector<SmallVector<MachineBasicBlock*, 4>, 4> paths);
++  void dump_list(SmallVector<MachineBasicBlock*, 4> path, unsigned id);
++};
++
++char RISCVPostRAFaultIndexCoalescer::ID = 0;
++
++void RISCVPostRAFaultIndexCoalescer::getAnalysisUsage(AnalysisUsage &AU) const {
++  AU.addRequired<PhysKnownBitsAnalysisWrapper>();
++  AU.addPreserved<PhysKnownBitsAnalysisWrapper>();
++  AU.addRequired<MachineBlockFrequencyInfo>();
++  AU.addRequired<MachineBranchProbabilityInfo>();
++  AU.addRequired<MachineLoopInfo>();
++  MachineFunctionPass::getAnalysisUsage(AU);
++}
++
++bool RISCVPostRAFaultIndexCoalescer::runOnMachineFunction(MachineFunction &MF) {
++  MRI = &MF.getRegInfo();
++  TRI = MF.getSubtarget().getRegisterInfo();
++  PKBA = &getAnalysis<PhysKnownBitsAnalysisWrapper>().get(MF);
++  MLI = &getAnalysis<MachineLoopInfo>();
++
++  init(MF);
++  unsigned step = 0;
++  STAT_LLVM_DEBUG(
++    dbgs() << "\n";
++    dbgs() << "# *** Run RISCVPostRAFaultIndexCoalescer\n";
++    dbgs() << "    * Dump MF:\n";
++    MF.dump();
++  );
++
++  // IR is not in SSA form. Def MIs must be computed first.
++  computeDefMIMap(MF);
++
++  // Initialization.
++  computeKnownBits(MF);
++
++  //computeBranchFreq(MF);
++  computeAccessMaps(MF);
++
++  // Iterative process.
++  initFIResultMap(MF);
++  DUMP_LLVM_DEBUG(
++    dbgs() << "[Step: " << step << "] Dump FIResMap after computeFIRuns -------\n";
++    dumpFIResMap(MF)
++  );
++
++  while (true) {
++    step++;
++
++    // compute FICandMap.
++    DUMP_LLVM_DEBUG(dbgs() << "[Step: " << step << "] ";);
++    if (computeFICandMap(MF)) {
++      DUMP_LLVM_DEBUG(
++        dbgs() << "** Dump FICandMap after computeFICandMap ------\n";
++        dumpFICandMap(MF)
++      );
++    } else {
++      DUMP_LLVM_DEBUG(dbgs() << "computeFICandMap did not update the FICandMap, quit the iteration\n");
++      DUMP_FINAL_FI_LLVM_DEBUG(
++        dbgs() << "[Step: " << step << "] Dump final FIResMap -------\n";
++        dumpFIResMap(MF)
++      );
++      STAT_LLVM_DEBUG(dumpFISpace(MF, step));
++      break;
++    }
++
++    // apply FICandMap to FIResMap.
++    DUMP_LLVM_DEBUG(dbgs() << "[Step: " << step << "] ";);
++    if (updateFIResultMap(MF)) {
++      DUMP_LLVM_DEBUG(
++        dbgs() << "** Dump FIResMap after updateFIResultMap ---\n";
++        dumpFIResMap(MF)
++      );
++    } else { 
++      DUMP_LLVM_DEBUG(dbgs() << "updateFIResultMap did not update the FIResMap, quit the iteration\n");
++      DUMP_FINAL_FI_LLVM_DEBUG(
++        dbgs() << "[Step: " << step << "] Dump final FIResMap -------\n";
++        dumpFIResMap(MF)
++      );
++      STAT_LLVM_DEBUG(dumpFISpace(MF, step));
++      break;
++    }
++  }
++
++  // Update MachineInstr with FIResMap
++  updateMIs(MF);
++
++  // True because of updateMIs()
++  return true;
++}
++
++void RISCVPostRAFaultIndexCoalescer::computeKnownBits(MachineFunction &MF) {
++
++  // Compute KnownBits with the indeitifed Def MIs.
++  for (auto &MBB : MF) {
++    for (MachineInstr &MI : MBB) {
++      if (MI.isDebugInstr()) continue;
++      for (auto &MOP : MI.operands()) {
++        if (MOP.isReg()) {
++          KnownBits kb;
++          kb = PKBA->getKnownBits(&MOP);
++          setKnownBitsMap(&MOP, kb);
++        }
++      }
++    }
++  }
++  KB_LLVM_DEBUG(dumpKnownBits(MF));
++}
++
++__attribute__((unused))
++void RISCVPostRAFaultIndexCoalescer::computeBranchFreq(MachineFunction &MF) {
++  MachineBlockFrequencyInfo &MBFI = getAnalysis<MachineBlockFrequencyInfo>();
++  MachineBranchProbabilityInfo &MBPI = getAnalysis<MachineBranchProbabilityInfo>();
++  for (auto &MBB : MF) {
++    dbgs() << "    BlockFrequency: " << MBFI.getBlockFreqRelativeToEntryBlock(&MBB) <<"\n";
++    for (auto &succ : MBB.successors())  {
++      dbgs() << "    BranchFrequency: to " << succ->getFullName() << ": "; MBPI.getEdgeProbability(&MBB, succ).dump();
++    }
++  }
++  DUMP_LLVM_DEBUG(dumpBranchFreq(MF));
++}
++
++void RISCVPostRAFaultIndexCoalescer::computeAccessMaps(MachineFunction &MF) {
++  PATH_LLVM_DEBUG(dbgs() << "[ Prepare ] Compute Access Maps:\n");
++  for (auto &MBB : MF) {
++    for (MachineInstr &MI : MBB) {
++      if (MI.isDebugInstr()) continue;
++      PATH_LLVM_DEBUG(dbgs() << "    Processing MI: "; MI.dump());
++      for (MachineOperand &MOP : MI.operands()) {
++        if (MOP.isReg() && !MOP.isKill()) {
++          if (MI.isCall() && MOP.getReg() != RISCV::X1)
++            continue;
++          PATH_LLVM_DEBUG(dbgs() << "               MOP: "; MOP.dump());
++          assert(NextAccMap.find(&MOP) == NextAccMap.end()
++              && "Duplicated entry for NextAccMap");
++          SmallVector<MachineOperand*, 4> nextUses;
++          getNextAccs(&MOP, nextUses);
++
++          // Set the forward relations.
++          NextAccMap[&MOP] = nextUses;
++
++          // Set the backward relations.
++          for (unsigned i = 0, e = nextUses.size(); i < e; i++) {
++            PATH_LLVM_DEBUG(dbgs() << "        Set nextUse[" << i << "]: ";nextUses[i]->getParent()->dump());
++            if (PrevAccMap.find(nextUses[i]) == PrevAccMap.end()) {
++              SmallVector<MachineOperand*, 4> prevAccs;
++              PrevAccMap[nextUses[i]] = prevAccs;
++            }
++            PrevAccMap[nextUses[i]].push_back(&MOP);
++          }
++        }
++      }
++    }
++  }
++  DUMP_LLVM_DEBUG(dumpAccessMaps(MF));
++}
++
++void RISCVPostRAFaultIndexCoalescer::computeDefMIMap(MachineFunction &MF) {
++  for (unsigned i = 0, ie = pIndepPaths.size(); i < ie; i++) {
++    SmallVector<MachineBasicBlock*, 4> path = pIndepPaths[i];
++    DenseMap<Register, MachineOperand*> LiveDef;
++    // Iterate over all paths and maintain a live-def per reg.
++    // add the live-def of the reg to the DefMOPMap whenever the reg is used.
++    for (unsigned j = 0, je = path.size(); j < je; j++) {
++      for (MachineInstr &mi : *path[j]) {
++        if (mi.isDebugInstr()) continue;
++        // Use happens before Def. Handle Uses first.
++        for (MachineOperand &mop: mi.operands()) {
++          if (!mop.isReg()) continue;
++          Register Reg = mop.getReg();
++          if (mop.isUse()) {
++            // This is possible for function call arguments
++            if (LiveDef.find(Reg) == LiveDef.end()) {
++              DEF_LLVM_DEBUG(dbgs() << "WARNING: Def for "
++                          << printReg(Reg, TRI) << " not found: "; mi.dump());
++            } else {
++              if (MRI->DefMOPMap.find(&mop) == MRI->DefMOPMap.end()) {
++                SmallVector<MachineOperand*, 4> defMOPs;
++                MRI->DefMOPMap[&mop] = defMOPs;
++              }
++              if (!isMOPInList(LiveDef[Reg], MRI->DefMOPMap[&mop])) {
++                MRI->DefMOPMap[&mop].push_back(LiveDef[Reg]);
++              }
++            }
++          }
++        }
++
++        // Handle Defs to update LiveDef
++        for (MachineOperand &mop: mi.operands()) {
++          if (!mop.isReg()) continue;
++          Register Reg = mop.getReg();
++          if (mop.isDef()) {
++            LiveDef[Reg] = &mop;
++          }
++        }
++      }
++    }
++  }
++  DUMP_LLVM_DEBUG(dumpDefMOPMap(MF));
++}
++
++void RISCVPostRAFaultIndexCoalescer::initFIResultMap(MachineFunction &MF) {
++  DUMP_LLVM_DEBUG(dbgs() << "---- Initialize FIResMap with naive FI Runs ----\n");
++  uint32_t FIResIdx = 1;
++  for (auto &MBB : MF) {
++    DenseSet<Register> FIRan;
++    for (MachineInstr &MI : MBB) {
++      if (MI.isDebugInstr()) continue;
++      if (MI.isCall()) {
++        // only RISCV::X1 needs to be checked. other implicit use/def regs will be handled at the callee.
++        for (auto &MOP : MI.operands()) {
++          if (MOP.isReg() && MOP.getReg() == RISCV::X1) {
++            Register Reg = MOP.getReg();
++            unsigned BitWidth = TRI->getRegSizeInBits(Reg, *MRI);
++            for (unsigned i = 0, e = BitWidth; i < e; i++) {
++              setFIResMap(&MOP, i, FIResIdx++);
++            }
++          }
++        }
++        continue;
++      }
++
++      for (auto &MOP : MI.operands()) {
++        if (MOP.isReg()) {
++          Register Reg = MOP.getReg();
++          unsigned BitWidth = TRI->getRegSizeInBits(Reg, *MRI);
++          // FI runs after any use/def if the reg is not killed.
++          // We assume FIs on previous values are performed already.
++          if (!MOP.isKill()) {
++            for (unsigned i = 0, e = BitWidth; i < e; i++)
++              setFIResMap(&MOP, i, FIResIdx++);
++            FIRan.insert(Reg);
++          // Make sure the assumption (that FI runs on previous values are
++          // already performed) is correct.
++          } else {
++            if (!FIRan.contains(Reg)) {
++              FIRan.insert(Reg);
++            }
++          }
++        }
++      }
++    }
++  }
++}
++
++void RISCVPostRAFaultIndexCoalescer::initFICandMap(MachineFunction &MF) {
++  // Initialize FICandMap
++  FICandMap.clear();
++  for (auto &MBB : MF) {
++    for (MachineInstr &MI : MBB) {
++      if (MI.isDebugInstr()) continue;
++      for (auto &MOP : MI.operands()) {
++        // FICandMap is to be applied on the register which is to be accessed.
++        if (MOP.isReg() && !MOP.isKill()) {
++          if (MI.isCall() && MOP.getReg() != RISCV::X1)
++            continue;
++          unsigned BitWidth = TRI->getRegSizeInBits(MOP.getReg(), *MRI);
++          for (unsigned i = 0, ie = NextAccMap[&MOP].size(); i < ie; i++) {
++            for (unsigned j = 0, je = BitWidth; j < je; j++) {
++              setFICandMap(&MOP, NextAccMap[&MOP][i], j, getFIResMap(&MOP, j));
++            }
++          }
++        }
++      }
++    }
++  }
++}
++
++bool RISCVPostRAFaultIndexCoalescer::computeFICandMap(MachineFunction &MF) {
++  DUMP_LLVM_DEBUG(dbgs() << "---- computeFICandMap by MI ----\n");
++  bool updated = false;
++  initFICandMap(MF);
++
++  DUMP_LLVM_DEBUG(dbgs() << " ---- Dump FICandMap after init\n");
++  DUMP_LLVM_DEBUG(dumpFICandMap(MF));
++
++  for (auto &MBB : MF) {
++    for (MachineInstr &MI : MBB) {
++      if (MI.isDebugInstr()) continue;
++      unsigned Opcode = MI.getOpcode();
++      switch (Opcode) {
++      default:
++        LLVM_DEBUG(dbgs() << "Unknown Opcode: "; MI.dump());
++        break;
++      case TargetOpcode::PHI:
++      {
++        // The fault injected can both continue and discontinue.
++        // Nothing can be assumed.
++        break;
++      }
++      case TargetOpcode::COPY:
++      {
++        MachineOperand *MOP0 = &MI.getOperand(0);
++        MachineOperand *MOP1 = &MI.getOperand(1);
++        // The ues-reg has no PrevAccMap entry.
++        if (!MOP1->getReg().isVirtual()) break;
++        unsigned BitWidth = TRI->getRegSizeInBits(MOP0->getReg(), *MRI);
++        // Copy the ResIDx of the def-reg to the use-reg.
++        for (unsigned i = 0, e = BitWidth; i < e; i++) {
++          uint32_t ResIdx = getFIResMap(MOP0, i);
++          updated |= setFICandMapAllPrevAcc(MOP1, i, ResIdx);
++        }
++        break;
++      }  
++      case RISCV::ADD:
++      case RISCV::ADDI:
++      case RISCV::SUB:
++      case RISCV::MUL:
++      {
++        break;
++      }
++
++      // mem load instructions.
++      case RISCV::LD:
++      case RISCV::LB:
++      case RISCV::LH:
++      case RISCV::LW:
++      case RISCV::LBU:
++      case RISCV::LHU:
++      case RISCV::LWU:
++      case RISCV::PseudoLB:
++      case RISCV::PseudoLBU:
++      case RISCV::PseudoLH:
++      case RISCV::PseudoLHU:
++      case RISCV::PseudoLW:
++
++      // mem store instructions.
++      case RISCV::SB:
++      case RISCV::SH:
++      case RISCV::SW:
++      case RISCV::SD:
++      case RISCV::PseudoSB:
++      case RISCV::PseudoSH:
++      case RISCV::PseudoSW:
++
++      // Load immediate
++      case RISCV::LUI:
++      case RISCV::PseudoLI:
++
++      // Instructions with no data update.
++      case RISCV::URET:
++      case RISCV::SRET:
++      case RISCV::MRET:
++      case RISCV::DRET:
++
++      case RISCV::AUIPC:
++      case RISCV::PseudoLLA:
++      case RISCV::PseudoLA:
++      case RISCV::PseudoLA_TLS_IE:
++      case RISCV::PseudoLA_TLS_GD:
++      case RISCV::JAL:
++      case RISCV::JALR:
++
++      case RISCV::CSRRW:
++      case RISCV::CSRRS:
++      case RISCV::CSRRC:
++      case RISCV::CSRRWI:
++      case RISCV::CSRRSI:
++      case RISCV::CSRRCI:
++
++      // 64-bit instrs
++      case RISCV::ADDIW:
++      case RISCV::SLLIW:
++      case RISCV::SRLIW:
++      case RISCV::SRAIW:
++      case RISCV::ADDW:
++      case RISCV::SUBW:
++      case RISCV::SLLW:
++      case RISCV::SRLW:
++      case RISCV::SRAW:
++      case RISCV::PseudoLWU:
++      case RISCV::PseudoLD:
++      case RISCV::PseudoSD:
++      {
++        // No MI-level pruning possible.
++        break;
++      }
++
++      case RISCV::XOR:
++      case RISCV::XORI:
++      {
++        MachineOperand *MOP0 = &MI.getOperand(0);
++        MachineOperand *MOP1 = &MI.getOperand(1);
++        MachineOperand *MOP2 = &MI.getOperand(2);
++        KnownBits KB1 = getKnownBitsMap(MOP1);
++        KnownBits KB2;
++        if (Opcode == RISCV::XOR)
++          KB2 = getKnownBitsMap(MOP2);
++        else if(Opcode == RISCV::XORI)
++          getKnownBitsImm(MI, 2, KB1.getBitWidth(), KB2);
++        assert (KB1.getBitWidth() == KB2.getBitWidth()
++                && "Incompatible bitwidths");
++
++        for (unsigned i = 0, e = KB1.getBitWidth(); i < e; i++) {
++          uint32_t ResIdx = getFIResMap(MOP0, i);
++          // Flip of a bit in either MOP1 or MOP2 changes the bit of the MOP0.
++          updated |= setFICandMapAllPrevAcc(MOP1, i, ResIdx);
++          if (Opcode == RISCV::XOR)
++            updated |= setFICandMapAllPrevAcc(MOP2, i, ResIdx);
++        }
++        break;
++      }
++
++      case RISCV::OR:
++      case RISCV::ORI: {
++        MachineOperand *MOP0 = &MI.getOperand(0);
++        MachineOperand *MOP1 = &MI.getOperand(1);
++        MachineOperand *MOP2 = &MI.getOperand(2);
++        KnownBits KB1 = getKnownBitsMap(MOP1);
++        KnownBits KB2;
++        if (Opcode == RISCV::OR)
++          KB2 = getKnownBitsMap(MOP2);
++        else if(Opcode == RISCV::ORI)
++          getKnownBitsImm(MI, 2, KB1.getBitWidth(), KB2);
++        assert (KB1.getBitWidth() == KB2.getBitWidth()
++                && "Incompatible bitwidths");
++
++        for (unsigned i = 0, e = KB1.getBitWidth(); i < e; i++) {
++          uint32_t ResIdx = getFIResMap(MOP0, i);
++
++          // MOP1[i] == 0, MOP2[i] == 0
++          // - Flip of a bit in either MOP1 or MOP2 is same as the MOP0.
++          if (KB1.isZeroBit(i) && KB2.isZeroBit(i)) {
++            updated |= setFICandMapAllPrevAcc(MOP1, i, ResIdx);
++            if (Opcode == RISCV::OR)
++              updated |= setFICandMapAllPrevAcc(MOP2, i, ResIdx);
++          // MOP1[i] == 0, MOP2[i] == 1
++          // - Flip of a bit in MOP1 is dead.
++          // - Flip of a bit in MOP2 is same as that of MOP0.
++          } else if (KB1.isZeroBit(i) && KB2.isOneBit(i)) {
++            updated |= setFICandMapAllPrevAccDead(MOP1, i);
++            if (Opcode == RISCV::OR)
++              updated |= setFICandMapAllPrevAcc(MOP2, i, ResIdx);
++          // MOP1[i] == 0, MOP2[i] == X
++          // - Flip of a bit in MOP1 is uncertain.
++          // - Flip of a bit in MOP2 is same as the MOP0
++          } else if (KB1.isZeroBit(i) && KB2.isUnknownBit(i)) {
++            if (Opcode == RISCV::OR)
++              updated |= setFICandMapAllPrevAcc(MOP2, i, ResIdx);
++          // MOP1[i] == 1, MOP2[i] == 0
++          // - Flip of a bit in MOP1 is same as that of MOP0.
++          // - Flip of a bit in MOP2 is dead.
++          } else if (KB1.isOneBit(i) && KB2.isZeroBit(i)) {
++            updated |= setFICandMapAllPrevAcc(MOP1, i, ResIdx);
++            if (Opcode == RISCV::OR)
++              updated |= setFICandMapAllPrevAccDead(MOP2, i);
++          // MOP1[i] == 1, MOP2[i] == 1
++          // - Flip of a bit in either MOP1 or MOP2 is dead.
++          } else if (KB1.isOneBit(i) && KB2.isOneBit(i)) {
++            updated |= setFICandMapAllPrevAccDead(MOP1, i);
++            if (Opcode == RISCV::OR)
++              updated |= setFICandMapAllPrevAccDead(MOP2, i);
++          // MOP1[i] == 1, MOP2[i] == X
++          // - Flip of a bit in MOP1 is uncertain.
++          // - Flip of a bit in MOP2 is dead.
++          } else if (KB1.isOneBit(i) && KB2.isUnknownBit(i)) {
++            if (Opcode == RISCV::OR)
++              updated |= setFICandMapAllPrevAccDead(MOP2, i);
++          // MOP1[i] == X, MOP2[i] == 0
++          // - Flip of a bit in MOP1 is uncertain.
++          // - Flip of a bit in MOP2 is uncertain.
++          } else if (KB1.isUnknownBit(i) && KB2.isZeroBit(i)) {
++          // MOP1[i] == X, MOP2[i] == 1
++          // - Flip of a bit in MOP1 is dead.
++          // - Flip of a bit in MOP2 is uncertain.
++          } else if (KB1.isUnknownBit(i) && KB2.isOneBit(i)) {
++            updated |= setFICandMapAllPrevAccDead(MOP1, i);
++          // MOP1[i] == X, MOP2[i] == X
++          // - Flip of a bit in either MOP1 or MOP2 is uncertain.
++          } else if (KB1.isUnknownBit(i) && KB2.isUnknownBit(i)) {
++          }
++        }
++        break;
++      }
++
++      case RISCV::AND:
++      case RISCV::ANDI: {
++        MachineOperand *MOP0 = &MI.getOperand(0);
++        MachineOperand *MOP1 = &MI.getOperand(1);
++        MachineOperand *MOP2 = &MI.getOperand(2);
++        KnownBits KB1 = getKnownBitsMap(MOP1);
++        KnownBits KB2;
++        if (Opcode == RISCV::AND)
++          KB2 = getKnownBitsMap(MOP2);
++        else if(Opcode == RISCV::ANDI)
++          getKnownBitsImm(MI, 2, KB1.getBitWidth(), KB2);
++
++        assert (KB1.getBitWidth() == KB2.getBitWidth()
++                && "Incompatible bitwidths");
++
++        for (unsigned i = 0, e = KB2.getBitWidth(); i < e; i++) {
++          uint32_t ResIdx = getFIResMap(MOP0, i);
++          // MOP1[i] == 0, MOP2[i] == 0
++          //  - Flip of a bit in MOP1 is dead.
++          //  - Flip of a bit in MOP2 is dead.
++          if (KB1.isZeroBit(i) && KB2.isZeroBit(i)) {
++            updated |= setFICandMapAllPrevAccDead(MOP1, i);
++            if (Opcode == RISCV::AND)
++              updated |= setFICandMapAllPrevAccDead(MOP2, i);
++          // MOP1[i] == 0, MOP2[i] == 1
++          //  - Flip of a bit in MOP1 is same as that of MOP0.
++          //  - Flip of a bit in MOP2 is dead.
++          } else if (KB1.isZeroBit(i) && KB2.isOneBit(i)) {
++            updated |= setFICandMapAllPrevAcc(MOP1, i, ResIdx);
++            if (Opcode == RISCV::AND)
++              updated |= setFICandMapAllPrevAccDead(MOP2, i);
++          // MOP1[i] == 0, MOP2[i] == X
++          //  - Flip of a bit in MOP1 is uncertain.
++          //  - Flip of a bit in MOP2 is dead.
++          } else if (KB1.isZeroBit(i) && KB2.isUnknownBit(i)) {
++            if (Opcode == RISCV::AND)
++              updated |= setFICandMapAllPrevAccDead(MOP2, i);
++          // MOP1[i] == 1, MOP2[i] == 0
++          //  - Flip of a bit in MOP1 is dead.
++          //  - Flip of a bit in MOP2 is same as that of MOP0
++          } else if (KB1.isOneBit(i) && KB2.isZeroBit(i)) {
++            updated |= setFICandMapAllPrevAccDead(MOP1, i);
++            if (Opcode == RISCV::AND)
++              updated |= setFICandMapAllPrevAcc(MOP2, i, ResIdx);
++          // MOP1[i] == 1, MOP2[i] == 1
++          //  - Flip of a bit in MOP1 is same as that of MOP0
++          //  - Flip of a bit in MOP2 is same as that of MOP0
++          } else if (KB1.isOneBit(i) && KB2.isOneBit(i)) {
++            updated |= setFICandMapAllPrevAcc(MOP1, i, ResIdx);
++            if (Opcode == RISCV::AND)
++              updated |= setFICandMapAllPrevAcc(MOP2, i, ResIdx);
++          // MOP1[i] == 1, MOP2[i] == X
++          //  - Flip of a bit in MOP1 is uncertain
++          //  - Flip of a bit in MOP2 is same as that of MOP0
++          } else if (KB1.isOneBit(i) && KB2.isUnknownBit(i)) {
++            if (Opcode == RISCV::AND)
++              updated |= setFICandMapAllPrevAcc(MOP2, i, ResIdx);
++          // MOP1[i] == X, MOP2[i] == 0
++          //  - Flip of a bit in MOP1 is dead
++          //  - Flip of a bit in MOP2 is uncertain
++          } else if (KB1.isUnknownBit(i) && KB2.isZeroBit(i)) {
++            updated |= setFICandMapAllPrevAccDead(MOP1, i);
++          // MOP1[i] == X, MOP2[i] == 1
++          //  - Flip of a bit in MOP1 is same as that of MOP0
++          //  - Flip of a bit in MOP2 is uncertain
++          } else if (KB1.isUnknownBit(i) && KB2.isOneBit(i)) {
++            updated |= setFICandMapAllPrevAcc(MOP1, i, ResIdx);
++          // MOP1[i] == X, MOP2[i] == X
++          //  - Flip of a bit in MOP1 is uncertain
++          //  - Flip of a bit in MOP2 is uncertain
++          } else if (KB1.isUnknownBit(i) && KB2.isUnknownBit(i)) {
++          }
++        }
++        break;
++      }
++
++      case RISCV::SLT:
++      case RISCV::SLTU:
++      // Branch instructions.
++      case RISCV::BEQ:
++      case RISCV::BNE:
++      case RISCV::BGE:
++      case RISCV::BGEU:
++      case RISCV::BLT:
++      case RISCV::BLTU: {
++        // These instructions discontinues any faults.
++        // SLT: FICandMap values of each MOP are categorized into three groups,
++        //      {true, false, unknown}
++        MachineOperand* MOP1;
++        MachineOperand* MOP2;
++        if (Opcode == RISCV::SLT || Opcode == RISCV::SLTU) {
++          MOP1 = &MI.getOperand(1);
++          MOP2 = &MI.getOperand(2);
++        } else {
++          MOP1 = &MI.getOperand(0);
++          MOP2 = &MI.getOperand(1);
++        }
++        KnownBits KB1 = getKnownBitsMap(MOP1);
++        KnownBits KB2 = getKnownBitsMap(MOP2);
++        assert (KB1.getBitWidth() == KB2.getBitWidth()
++                && "Incompatible bitwidths");
++
++        std::optional<bool> sol;
++        if (Opcode == RISCV::SLT || Opcode == RISCV::BLT)
++          sol = KnownBits::slt(KB1, KB2);
++        else if (Opcode == RISCV::SLTU || Opcode == RISCV::BLTU)
++          sol = KnownBits::ult(KB1, KB2);
++        else if (Opcode == RISCV::BEQ)
++          sol = KnownBits::eq(KB1, KB2);
++        else if (Opcode == RISCV::BNE)
++          sol = KnownBits::ne(KB1, KB2);
++        else if (Opcode == RISCV::BGE)
++          sol = KnownBits::sge(KB1, KB2);
++        else if (Opcode == RISCV::BGEU)
++          sol = KnownBits::uge(KB1, KB2);
++        else if (Opcode == RISCV::BLT)
++          sol = KnownBits::slt(KB1, KB2);
++        else if (Opcode == RISCV::BLTU)
++          sol = KnownBits::ult(KB1, KB2);
++
++        // For FI runs on KB1
++        int64_t TrueBitPos = -1;
++        int64_t FalseBitPos = -1;
++        int64_t TrueFIRes = -1;
++        int64_t FalseFIRes = -1;
++        for (unsigned i = 0, e = KB1.getBitWidth(); i < e; i++) {
++          KnownBits KB1flipped = KnownBits(KB1.Zero, KB1.One);
++          KB1flipped.flipABit(i);
++          std::optional<bool> FIRes;
++          if (Opcode == RISCV::SLT || Opcode == RISCV::BLT)
++            FIRes = KnownBits::slt(KB1flipped, KB2);
++          else if (Opcode == RISCV::SLTU || Opcode == RISCV::BLTU)
++            FIRes = KnownBits::ult(KB1flipped, KB2);
++          else if (Opcode == RISCV::BEQ)
++            FIRes = KnownBits::eq(KB1flipped, KB2);
++          else if (Opcode == RISCV::BNE)
++            FIRes = KnownBits::ne(KB1flipped, KB2);
++          else if (Opcode == RISCV::BGE)
++            FIRes = KnownBits::sge(KB1flipped, KB2);
++          else if (Opcode == RISCV::BGEU)
++            FIRes = KnownBits::uge(KB1flipped, KB2);
++          else if (Opcode == RISCV::BLT)
++            FIRes = KnownBits::slt(KB1flipped, KB2);
++          else if (Opcode == RISCV::BLTU)
++            FIRes = KnownBits::ult(KB1flipped, KB2);
++
++          if (FIRes == std::nullopt) continue;
++          if (FIRes == true) {
++            if (TrueBitPos == -1)
++              TrueBitPos = i;
++            if (TrueFIRes == -1)
++              TrueFIRes = getFICandMap(PrevAccMap[MOP1][0], MOP1, i);
++
++            // If there is only a single PrevAcc of MOP1, then propagate the
++            // absolute FIRes. Otherwise copy within the MOP1.
++            // (Allows to share the FIRes across use operands.)
++            if (hasOnlyOnePrevAcc(MOP1))
++              updated |= setFICandMapAllPrevAcc(MOP1, i, TrueFIRes);
++            else
++              updated |= copyFICandMapAllPrevAcc(MOP1, TrueBitPos, i);
++          } else if (FIRes == false) {
++            if (FalseBitPos == -1)
++              FalseBitPos = i;
++            if (FalseFIRes == -1)
++              FalseFIRes = getFICandMap(PrevAccMap[MOP1][0], MOP1, i);
++
++            // If there is only a single PrevAcc of MOP1, then propagate the
++            // absolute FIRes. Otherwise copy within the MOP1.
++            // (Allows to share the FIRes across use operands.)
++            if (hasOnlyOnePrevAcc(MOP1))
++              updated |= setFICandMapAllPrevAcc(MOP1, i, FalseFIRes);
++            else
++              updated |= copyFICandMapAllPrevAcc(MOP1, FalseBitPos, i);
++          }
++        }
++
++        // For FI runs on KB2
++        // True/FalseBitPoses cannot be shared across operands to be safe.
++        TrueBitPos = -1;
++        FalseBitPos = -1;
++        for (unsigned i = 0, e = KB2.getBitWidth(); i < e; i++) {
++          KnownBits KB2flipped = KnownBits(KB2.Zero, KB2.One);
++          KB2flipped.flipABit(i);
++          std::optional<bool> FIRes;
++          if (Opcode == RISCV::SLT || Opcode == RISCV::BLT)
++            FIRes = KnownBits::slt(KB1, KB2flipped);
++          else if (Opcode == RISCV::SLTU || Opcode == RISCV::BLTU)
++            FIRes = KnownBits::ult(KB1, KB2flipped);
++          else if (Opcode == RISCV::BEQ)
++            FIRes = KnownBits::eq(KB1, KB2flipped);
++          else if (Opcode == RISCV::BNE)
++            FIRes = KnownBits::ne(KB1, KB2flipped);
++          else if (Opcode == RISCV::BGE)
++            FIRes = KnownBits::sge(KB1, KB2flipped);
++          else if (Opcode == RISCV::BGEU)
++            FIRes = KnownBits::uge(KB1, KB2flipped);
++          else if (Opcode == RISCV::BLT)
++            FIRes = KnownBits::slt(KB1, KB2flipped);
++          else if (Opcode == RISCV::BLTU)
++            FIRes = KnownBits::ult(KB1, KB2flipped);
++
++          if (FIRes == std::nullopt) continue;
++          if (FIRes == true) {
++            if (TrueBitPos == -1)
++              TrueBitPos = i;
++
++            if (TrueFIRes == -1) {
++              TrueFIRes = getFICandMap(PrevAccMap[MOP2][0], MOP2, i);
++            }
++
++            // If there is only a single PrevAcc of MOP2, then propagate the
++            // absolute FIRes. Otherwise copy within the MOP2.
++            // (Allows to share the FIRes across use operands.)
++            if (hasOnlyOnePrevAcc(MOP2))
++              updated |= setFICandMapAllPrevAcc(MOP2, i, TrueFIRes);
++            else
++              updated |= copyFICandMapAllPrevAcc(MOP2, TrueBitPos, i);
++          } else if (FIRes == false) {
++            if (FalseBitPos == -1)
++              FalseBitPos = i;
++            if (FalseFIRes == -1)
++              FalseFIRes = getFICandMap(PrevAccMap[MOP2][0], MOP2, i);
++
++            // If there is only a single PrevAcc of MOP2, then propagate the
++            // absolute FIRes. Otherwise copy within the MOP2.
++            // (Allows to share the FIRes across use operands.)
++            if (hasOnlyOnePrevAcc(MOP2))
++              updated |= setFICandMapAllPrevAcc(MOP2, i, FalseFIRes);
++            else
++              updated |= copyFICandMapAllPrevAcc(MOP2, FalseBitPos, i);
++          }
++        }
++        break;
++      }
++      case RISCV::SLTI:
++      case RISCV::SLTIU: {
++        // These instructions discontinues any faults.
++        // SLTI: FICandMap values of each MOP are categorized into three groups,
++        //       {true, false, unknown}
++        MachineOperand *MOP1 = &MI.getOperand(1);
++        KnownBits KB1 = getKnownBitsMap(MOP1);
++        KnownBits KB2;
++        getKnownBitsImm(MI, 2, KB1.getBitWidth(), KB2);
++
++        std::optional<bool> sol;
++        if (Opcode == RISCV::SLTI)
++          sol = KnownBits::slt(KB1, KB2);
++        else if (Opcode == RISCV::SLTIU)
++          sol = KnownBits::ult(KB1, KB2);
++
++        // For FI runs on KB1
++        int64_t TrueBitPos = -1;
++        int64_t FalseBitPos = -1;
++        for (unsigned i = 0, e = KB1.getBitWidth(); i < e; i++) {
++          KnownBits KB1flipped = KnownBits(KB1.Zero, KB1.One);
++          KB1flipped.flipABit(i);
++          std::optional<bool> FIRes;
++          if (Opcode == RISCV::SLTI)
++            FIRes = KnownBits::slt(KB1flipped, KB2);
++          else if (Opcode == RISCV::SLTIU)
++            FIRes = KnownBits::ult(KB1flipped, KB2);
++
++          if (FIRes == std::nullopt) continue;
++          if (FIRes == true) {
++            if (TrueBitPos == -1)
++              TrueBitPos = i;
++            else
++              updated |= copyFICandMapAllPrevAcc(MOP1, TrueBitPos, i);
++          } else if (FIRes == false) {
++            if (FalseBitPos == -1)
++              FalseBitPos = i;
++            else
++              updated |= copyFICandMapAllPrevAcc(MOP1, FalseBitPos, i);
++          }
++        }
++        break;
++      }
++
++      case RISCV::SLL:
++      case RISCV::SLLI: {
++        // SLL: any fault injected on top [MOP2] bits are dead.
++        MachineOperand *MOP0 = &MI.getOperand(0);
++        MachineOperand *MOP1 = &MI.getOperand(1);
++        MachineOperand *MOP2 = &MI.getOperand(2);
++        unsigned BitWidth = TRI->getRegSizeInBits(MOP1->getReg(), *MRI);
++        KnownBits KB2;
++        if (Opcode == RISCV::SLL)
++          KB2 = getKnownBitsMap(MOP2);
++        else if(Opcode == RISCV::SLLI)
++          getKnownBitsImm(MI, 2, BitWidth, KB2);
++
++        // The location of the bits after the MI is known.
++        //  - Faults injected in top {KB2Val} bits of MOP1 are dead.
++        //  - Faults injected in MOP1[i] is same as of MOP0[i+KB2Val]
++        if (KB2.isConstant()) {
++          const uint64_t KB2Val = *KB2.getConstant().getRawData();
++          for (unsigned i = 0, e = BitWidth; i < e; i++) {
++            if (i+KB2Val >= BitWidth) {
++              updated |= setFICandMapAllPrevAccDead(MOP1, i);
++            } else {
++              uint32_t ResIdx = getFIResMap(MOP0, i+KB2Val);
++              updated |= setFICandMapAllPrevAcc(MOP1, i, ResIdx);
++            }
++          }
++        // Only the minimum distance of the shift is known.
++        //  - Faults injected in top {KB2Min} bits of MOP1 are dead.
++        } else {
++          const uint64_t KB2Min = *KB2.getMinValue().getRawData();
++          for (unsigned i = 0, e = KB2Min; i < e; i++)
++            updated |= setFICandMapAllPrevAccDead(MOP1, BitWidth-i-1);
++        }
++        break;
++      }
++
++      case RISCV::SRL:
++      case RISCV::SRA:
++      case RISCV::SRLI:
++      case RISCV::SRAI: {
++        // SRL: any fault injected on bottom [MOP2] bits are dead.
++        MachineOperand *MOP0 = &MI.getOperand(0);
++        MachineOperand *MOP1 = &MI.getOperand(1);
++        MachineOperand *MOP2 = &MI.getOperand(2);
++        unsigned BitWidth = TRI->getRegSizeInBits(MOP1->getReg(), *MRI);
++        KnownBits KB2;
++        if (Opcode == RISCV::SRL || Opcode == RISCV::SRA)
++          KB2 = getKnownBitsMap(MOP2);
++        else if(Opcode == RISCV::SRLI || Opcode == RISCV::SRAI)
++          getKnownBitsImm(MI, 2, BitWidth, KB2);
++
++
++        // SRA: MSB (sign bit) is copied to the any vacant positions. Thus,
++        //      no collapsing is possible on sign bit for SRA or SRAI.
++        if (Opcode == RISCV::SRA || Opcode == RISCV::SRAI) {
++          // Exclude sign bit from the collapsing
++          BitWidth = BitWidth-1;
++        }
++
++        // The location of the bits after the MI is known.
++        //  - Faults injected in bottom {KB2Val} bits of MOP1 are dead.
++        //  - Faults injected in MOP1[i] is same as of MOP0[i-KB2Val]
++        if (KB2.isConstant()) {
++          const uint64_t KB2Val = *KB2.getConstant().getRawData();
++          for (unsigned i = 0, e = BitWidth; i < e; i++) {
++            if (i < KB2Val) {
++              updated |= setFICandMapAllPrevAccDead(MOP1, i);
++            } else {
++              uint32_t ResIdx = getFIResMap(MOP0, i-KB2Val);
++              updated |= setFICandMapAllPrevAcc(MOP1, i, ResIdx);
++            }
++          }
++        // Only the minimum distance of the shift is known.
++        //  - Faults injected in top {KB2Min} bits of MOP1 are dead.
++        } else {
++          const uint64_t KB2Min = *KB2.getMinValue().getRawData();
++          for (unsigned i = 0, e = KB2Min; i < e; i++)
++            updated |= setFICandMapAllPrevAccDead(MOP1, i);
++        }
++        break;
++        
++      }
++      }
++    }
++  }
++  return updated;
++}
++
++bool RISCVPostRAFaultIndexCoalescer::updateFIResultMap(MachineFunction &MF) { 
++  DUMP_LLVM_DEBUG(dbgs() << "---- Compute pruned FI Runs by MBB ----\n");
++  bool updated = false;
++  for (auto &MBB : MF) {
++    // For all regs (that are accessed):
++    //   1) intersect the FICandMap values of all the `next Uses', and
++    //   2) apply the merged FICandMap to the FIResMap of the def reg
++    for (MachineInstr &MI : MBB) {
++      if (MI.isDebugInstr()) continue;
++      for (MachineOperand &MOP : MI.operands()) {
++        if (MOP.isReg() && !MOP.isImplicit()) {
++          // Do not update if MOP is stateful:
++          // (1) MOP is live-out (i.e. liveness of the value lives out of MBB)
++          // (2) succs includes loops in different state
++          if (isLiveOutMBB(&MOP)) {
++            bool mayStateful = false;
++            MachineLoop *L = MLI->getLoopFor(&MBB);
++            if (L) {
++              for (MachineBasicBlock *NextMBB: MBB.successors()) {
++                MachineLoop *NextL = MLI->getLoopFor(NextMBB);
++                // Any loop header updates states
++                if (MLI->isLoopHeader(NextMBB))
++                  mayStateful = true;
++                // Next Access is in different loop
++                if (NextL && L != NextL)
++                  mayStateful = true;
++              }
++              // MOP is stateful. Do not coalesce.
++              if (mayStateful)
++                continue;
++            }
++          }
++
++          Register Reg = MOP.getReg();
++          unsigned bitwidth = TRI->getRegSizeInBits(Reg, *MRI);
++          for (unsigned i = 0, ie = bitwidth; i < ie; i++) {
++            int64_t newResIdx = -1;
++            bool conflict = false;
++            for (auto &V : FICandMap[&MOP]) {
++              FIResTy UseFIRes = V.second;
++              if (newResIdx == -1)
++                newResIdx = getFIRes(UseFIRes, i);
++              else {
++                if (newResIdx != getFIRes(UseFIRes, i)) {
++                  conflict = true;
++                  break;
++                }
++              }
++            }
++
++            // Something to be merged.
++            if (!conflict && newResIdx != -1)
++              updated |= setFIResMap(&MOP, i, newResIdx);
++          }
++        }
++      }
++    }
++  }
++  return updated;
++}
++
++
++void RISCVPostRAFaultIndexCoalescer::calculateFaultSiteSpace(MachineFunction &MF) {
++  // Version 2: getNextAccs builds FaultSites.
++  for (MachineBasicBlock &MBB : MF) {
++    unsigned numFaultSites = 0;
++    unsigned numDeadFaultSites = 0;
++    for (MachineInstr &MI : MBB) {
++      if (MI.isDebugInstr()) continue;
++      if (FaultSites.find(&MI) == FaultSites.end()) continue;
++      // Compute the number of fault sites
++      // 32 as the size of the reg file of the interest
++      // 32 as the bitwidth of a register of the interest..
++      if (FaultSites[&MI].size() > 32) {
++        STAT_LLVM_DEBUG(dbgs() << "Warning: "<<MBB.getFullName()<<": ";
++                   MI.dump(); dbgs() << ": has more than 32 live vregs\n");
++        numFaultSites += 32 * 32;
++      } else
++        numFaultSites += FaultSites[&MI].size() * 32;
++
++      // Compute the number of dead fault sites
++      for (auto &V : FaultSites[&MI]) {
++        unsigned BitWidth = TRI->getRegSizeInBits(V.first, *MRI);
++        for (unsigned i = 0, e = BitWidth; i < e; i++) {
++          if (getFIResMap(V.second, i) == 0)
++            numDeadFaultSites++;
++        }
++      }
++    }
++    FaultSitesMap[&MBB] = numFaultSites;
++    DeadFaultSitesMap[&MBB] = numDeadFaultSites;
++  }
++  DUMP_LLVM_DEBUG(dumpFaultSites(MF));
++}
++
++void RISCVPostRAFaultIndexCoalescer::calculateFISpace(MachineFunction &MF) {
++  FISpaceMap.clear();
++
++  for (MachineBasicBlock &MBB : MF) {
++    unsigned NumFISpace = 0;
++    for (MachineInstr &MI : MBB) {
++      for (MachineOperand &MOP : MI.operands()) {
++        if (FIResMap.find(&MOP) != FIResMap.end()) {
++          unsigned bitwidth = TRI->getRegSizeInBits(MOP.getReg(), *MRI);
++          assert (FIResMap[&MOP].size() == bitwidth
++              && "FIResMap[MOP].size() is not of bitwidth");
++          NumFISpace += FIResMap[&MOP].size();
++        }
++      }
++    }
++    FISpaceMap[&MBB] = NumFISpace;
++  }
++}
++
++void RISCVPostRAFaultIndexCoalescer::calculateFIRuns(MachineFunction &MF) {
++  FIRunsMap.clear();
++
++  unsigned totalFISpace = 0;
++  for (auto &V : FISpaceMap)
++    totalFISpace += V.second;
++
++  for (MachineBasicBlock &MBB : MF) {
++    // Waste of space.
++    BitVector LiveFIBitVec(totalFISpace+1);
++    unsigned NumDeadFIRuns = 0;
++    for (MachineInstr &MI : MBB) {
++      for (MachineOperand &MOP : MI.operands()) {
++        if (FIResMap.find(&MOP) != FIResMap.end()) {
++          unsigned bitwidth = TRI->getRegSizeInBits(MOP.getReg(), *MRI);
++          assert (FIResMap[&MOP].size() == bitwidth
++              && "FIResMap[MOP].size() is not of bitwidth");
++          for (unsigned i = 0; i < bitwidth; i++) {
++            LiveFIBitVec.set(FIResMap[&MOP][i].second);
++            if (FIResMap[&MOP][i].second == 0)
++              NumDeadFIRuns++;
++          }
++        }
++      }
++    }
++    FIRunsMap[&MBB] = LiveFIBitVec.count();
++    DeadFIRunsMap[&MBB] = NumDeadFIRuns;
++  }
++}
++
++void RISCVPostRAFaultIndexCoalescer::updateMIs(MachineFunction &MF) {
++  // Initialize
++  for (MachineBasicBlock &MBB : MF) {
++    for (MachineInstr &MI : MBB) {
++      MI.DefRegMOPs.clear();
++      MI.UseRegMOPs.clear();
++      MI.RIMap.clear();
++    }
++  }
++
++  // Set the values
++  for (MachineBasicBlock &MBB : MF) {
++    for (MachineInstr &MI : MBB) {
++      for (MachineOperand &MOP : MI.operands()) {
++        if (MOP.isReg()) {
++          if (MI.isCall() && MOP.getReg() != RISCV::X1)
++            continue;
++          if (MOP.isDef()) {
++            MI.DefRegMOPs.push_back(&MOP);
++          } else {
++            MI.UseRegMOPs.push_back(&MOP);
++          }
++          MI.RIMap[&MOP] = FIResMap[&MOP];
++        }
++      }
++    }
++  }
++}
++
++bool RISCVPostRAFaultIndexCoalescer::setFIRes(FIResTy &FIRes,
++                                          uint8_t BitPos, uint32_t FIResIdx) {
++   for (uint8_t i = FIRes.size(), e = 0; i > e; i--) {
++    uint8_t bitpos = FIRes[i-1].first;
++    uint32_t firesidx = FIRes[i-1].second;
++    // If entry exists, replace it.
++    if (bitpos == BitPos) {
++      if (firesidx != FIResIdx) {
++        FIRes[i-1] = std::make_pair(BitPos, FIResIdx);
++        return true;
++      } else
++        return false;
++    }
++
++    if (bitpos < BitPos) {
++      if (i == FIRes.size())
++        FIRes.push_back(std::make_pair(BitPos, FIResIdx));
++      else
++        FIRes.insert(&FIRes[i], std::make_pair(BitPos, FIResIdx));
++      return true;
++    }
++  }
++  return false;
++}
++
++bool RISCVPostRAFaultIndexCoalescer::setFIResMap(
++                     MachineOperand* MOP, uint8_t BitPos, uint32_t FIResIdx) {
++  assert(MOP->isReg() && "setFIResMap: MOP is not a Reg");
++  assert(BitPos < TRI->getRegSizeInBits(MOP->getReg(), *MRI)
++          && "setFIResMap: BitPos exceeds bitwidth");
++
++  // FIResMap does not have the MOP entry.
++  if (FIResMap.find(MOP) == FIResMap.end()) {
++    assert(BitPos == 0 && "setFIResMap: The new MOP entry must set BitPos 0");
++    FIResTy MOPEntry;
++    MOPEntry.push_back(std::make_pair(BitPos, FIResIdx));
++    FIResMap[MOP] = MOPEntry;
++    return true;
++  }
++
++  // FIResMap must have the MOP entry.
++  FIResTy &MOPFIResIdxs = FIResMap[MOP];
++  return setFIRes(MOPFIResIdxs, BitPos, FIResIdx);
++}
++
++__attribute__((unused))
++bool RISCVPostRAFaultIndexCoalescer::setFIResMapDead(
++                                        MachineOperand* MOP, uint8_t BitPos) {
++  return setFIResMap(MOP, BitPos, 0);
++}
++
++uint32_t RISCVPostRAFaultIndexCoalescer::getFIRes(FIResTy &FIRes,
++                                                         uint8_t BitPos) {
++  for (uint8_t i = FIRes.size(), e = 0; i > e; i--) {
++    uint8_t bitpos = FIRes[i-1].first;
++    uint32_t firesidx = FIRes[i-1].second;
++    // If entry exists, replace it.
++    if (bitpos == BitPos)
++      return firesidx;
++  }
++  llvm_unreachable("Entry not found");
++}
++
++uint32_t RISCVPostRAFaultIndexCoalescer::getFIResMap(
++                                        MachineOperand* MOP, uint8_t BitPos) {
++  assert(MOP->isReg() && "getFIResMap: MOP is not a Reg");
++  assert(BitPos < TRI->getRegSizeInBits(MOP->getReg(), *MRI)
++          && "getFIResMap: BitPos exceeds bitwidth");
++  assert(FIResMap.find(MOP) != FIResMap.end()
++          && "getFIResMap: MOP not found in FIResMap");
++
++  return getFIRes(FIResMap[MOP], BitPos);
++}
++
++__attribute__((unused))
++void RISCVPostRAFaultIndexCoalescer::addFaultSite(MachineInstr *MI,
++                                          Register Reg, MachineOperand* MOP) {
++  if (FaultSites.find(MI) == FaultSites.end()) {
++    RegMapTy prevAccMap;
++    FaultSites[MI] = prevAccMap;
++  }
++  FaultSites[MI][Reg] = MOP;
++}
++
++__attribute__((unused))
++void RISCVPostRAFaultIndexCoalescer::removeFaultSite(MachineInstr *MI,
++                                                               Register Reg) {
++  assert(FaultSites.find(MI) == FaultSites.end() && "MI not in FaultSites");
++  assert(FaultSites[MI].find(Reg) == FaultSites[MI].end()
++         && "Reg not in FaultSites[MI]");
++
++  FaultSites[MI].erase(Reg);
++}
++
++bool RISCVPostRAFaultIndexCoalescer::setFICandMap(MachineOperand* MOP,
++                  MachineOperand* UseMOP, uint8_t BitPos, uint32_t FIResIdx) {
++  assert(MOP->isReg() && "setFICandMap: MOP is not a Reg");
++  assert(BitPos < TRI->getRegSizeInBits(MOP->getReg(), *MRI)
++          && "setFICandMap: BitPos exceeds bitwidth");
++  assert(NextAccMap.find(MOP) != NextAccMap.end()
++          && "setFICandMap: MOP not in NextAccMap");
++  assert(isMOPInList(UseMOP, NextAccMap[MOP])
++          && "setFICandMap: UseMOP is not the next access of the MOP");
++
++  // FICandMap does not have the MOP entry.
++  if (FICandMap.find(MOP) == FICandMap.end()) {
++    assert(BitPos == 0 && "setFICandMap: The new MOP entry must set BitPos 0");
++    FIResMapTy UseMOPMap;
++    FIResTy UseMOPEntry;
++    UseMOPEntry.push_back(std::make_pair(BitPos, FIResIdx));
++    UseMOPMap[UseMOP] = UseMOPEntry;
++    FICandMap[MOP] = UseMOPMap;
++    return true;
++  }
++
++  // FICandMap[MOP] does not have the UseMOP entry.
++  if (FICandMap[MOP].find(UseMOP) == FICandMap[MOP].end()) {
++    assert(BitPos == 0 && "setFICandMap: The new UseMOP entry must set BitPos 0");
++    FIResTy UseMOPEntry;
++    UseMOPEntry.push_back(std::make_pair(BitPos, FIResIdx));
++    FICandMap[MOP][UseMOP] = UseMOPEntry; 
++    return true;
++  }
++
++  // FICandMap must have the [MOP][UseMOP] entry.
++  FIResTy &UseMOPFIResIdxs = FICandMap[MOP][UseMOP];
++  return setFIRes(UseMOPFIResIdxs, BitPos, FIResIdx);
++}
++
++__attribute__((unused))
++bool RISCVPostRAFaultIndexCoalescer::setFICandMapDead(
++                MachineOperand* MOP, MachineOperand* UseMOP, uint8_t BitPos) {
++  return setFICandMap(MOP, UseMOP, BitPos, 0);
++}
++
++bool RISCVPostRAFaultIndexCoalescer::setFICandMapAllPrevAcc(
++                  MachineOperand* UseMOP, uint8_t BitPos, uint32_t FIResIdx) {
++  bool updated = false;
++  for (unsigned i = 0, e = PrevAccMap[UseMOP].size(); i < e; i++)
++    updated |= setFICandMap(PrevAccMap[UseMOP][i], UseMOP, BitPos, FIResIdx);
++  return updated;
++}
++
++bool RISCVPostRAFaultIndexCoalescer::setFICandMapAllPrevAccDead(
++                                     MachineOperand* UseMOP, uint8_t BitPos) {
++  return setFICandMapAllPrevAcc(UseMOP, BitPos, 0);
++}
++
++
++uint32_t RISCVPostRAFaultIndexCoalescer::getFICandMap(
++                 MachineOperand* MOP, MachineOperand* UseMOP, uint8_t BitPos) {
++  assert(MOP->isReg() && "getFICandMap: MOP is not a Reg");
++  assert(UseMOP->isReg() && "getFICandMap: UseMOP is not a Reg");
++  assert(BitPos < TRI->getRegSizeInBits(MOP->getReg(), *MRI)
++          && "getFICandMap: BitPos exceeds bitwidth");
++  assert(FICandMap.find(MOP) != FICandMap.end()
++          && "getFICandMap: MOP not found in FICandMap");
++  assert(FICandMap[MOP].find(UseMOP) != FICandMap[MOP].end()
++          && "getFICandMap: UseMOP not found in FICandMap[MOP]");
++
++  FIResTy MOPFIResIdxs = FICandMap[MOP][UseMOP];
++  for (uint8_t i = MOPFIResIdxs.size(), e = 0; i > e; i--) {
++    uint8_t bitpos = MOPFIResIdxs[i-1].first;
++    uint32_t firesidx = MOPFIResIdxs[i-1].second;
++    // If entry exists, replace it.
++    if (bitpos == BitPos)
++      return firesidx;
++  }
++  llvm_unreachable("Entry not found");
++}
++
++bool RISCVPostRAFaultIndexCoalescer::copyFICandMapAllPrevAcc(MachineOperand* UseMOP, uint8_t fromBitPos, uint8_t toBitPos) {
++  bool updated = false;
++  DUMP_LLVM_DEBUG(
++  dbgs() << "copyFICandMapAllPrevAcc: UseMOP: "; UseMOP->dump();
++  dbgs() << "fromBitPos: " << (uint32_t) fromBitPos <<"\n";
++  dbgs() << "toBitPos  : " << (uint32_t) toBitPos << "\n";
++  );
++
++  for (unsigned i = 0, e = PrevAccMap[UseMOP].size(); i < e; i++) {
++    DUMP_LLVM_DEBUG(
++    dbgs() << "copyFICandMapAllPrevAcc: FIResIdx of " << i <<"\n";
++    dbgs() << "From: "; PrevAccMap[UseMOP][i]->getParent()->dump();
++    dbgs() << "To  : "; UseMOP->getParent()->dump();
++    );
++    uint32_t FIResIdx = getFICandMap(PrevAccMap[UseMOP][i], UseMOP, fromBitPos);
++    DUMP_LLVM_DEBUG(dbgs() << "FIResIdx  : " << FIResIdx << "\n");
++    updated |= setFICandMap(PrevAccMap[UseMOP][i], UseMOP, toBitPos, FIResIdx);
++  }
++  return updated;
++}
++
++bool RISCVPostRAFaultIndexCoalescer::isLiveOutMBB(MachineOperand* MOP) {
++  MachineInstr *mi = MOP->getParent();
++  MachineBasicBlock *mbb = mi->getParent();
++  Register reg = MOP->getReg();
++  bool foundCurMOP = false;
++  for (auto &mi : *mbb) {
++    if (mi.isDebugInstr()) continue;
++    // iterate over uses first
++    for (auto &mop : mi.operands()) {
++      if (!mop.isReg()) continue;
++      if (mop.isDef()) continue;
++
++      if (MOP == &mop) {
++        foundCurMOP = true;
++        continue;
++      }
++
++      // found the next access in the mbb and is killed.
++      if(foundCurMOP && mop.getReg() == reg && mop.isKill())
++        return false;
++    }
++    // iterate over def
++    for (auto &mop : mi.operands()) {
++      if (!mop.isReg()) continue;
++      if (!mop.isDef()) continue;
++
++      if (MOP == &mop) {
++        foundCurMOP = true;
++        continue;
++      }
++
++      // found the next def in the mbb. the MOP is overwritten.
++      if(foundCurMOP && mop.getReg() == reg)
++        return false;
++    }
++  }
++  return true;
++}
++
++__attribute__((unused))
++void RISCVPostRAFaultIndexCoalescer::dumpFISpace(MachineFunction &MF,
++                                                        unsigned step) {
++  dbgs() << "[Step: "<<step <<"] Statistics ---\n";
++  calculateFaultSiteSpace(MF);
++  calculateFISpace(MF);
++  calculateFIRuns(MF);
++
++  assert((FISpaceMap.size() == FIRunsMap.size()
++            && FISpaceMap.size() == DeadFIRunsMap.size())
++          && "Conflicts in sizes");
++
++  dbgs() << "MF: " << MF.getName() << "\n";
++  for (auto &V : FISpaceMap) {
++    MachineBasicBlock *MBB = V.first;
++    unsigned FISpace = V.second;
++    unsigned FaultSites = FaultSitesMap[MBB];
++    unsigned DeadFaultSites = DeadFaultSitesMap[MBB];
++    unsigned LiveFIRuns = FIRunsMap[MBB];
++    unsigned DeadFIRuns = DeadFIRunsMap[MBB];
++    dbgs() << "MBB: " << MBB->getFullName() << "\n";
++    dbgs() << "Fault Sites Space: " << FaultSites << "\n";
++    dbgs() << "Dead Fault Sites Space: " << DeadFaultSites << "\n";
++    dbgs() << "Dead/Fault Sites: " << format("%3.2f", (((float)DeadFaultSites)/FaultSites*100)) << "%\n";
++    dbgs() << "FI Space: " << FISpace <<"\n";
++    dbgs() << "Live FI Runs: " << LiveFIRuns << "\n";
++    dbgs() << "Dead FI Runs: " << DeadFIRuns << "\n";
++    dbgs() << "Live/Space: " << format("%3.2f", (((float)LiveFIRuns)/FISpace*100)) << "%\n";
++    dbgs() << "Dead/Space: " << format("%3.2f", (((float)DeadFIRuns)/FISpace*100)) << "%\n";
++    dbgs() << "\n";
++  }
++}
++
++__attribute__((unused))
++void RISCVPostRAFaultIndexCoalescer::dumpKnownBits(MachineFunction &MF) {
++  for (auto &MBB : MF) {
++    dbgs() << "//========================================\n";
++    dbgs() << "+ print KnownBits for "<< MBB.getFullName() << "\n";
++
++    for (MachineInstr &MI : MBB) {
++      if (MI.isDebugInstr()) continue;
++      dbgs() << "//----------------------------------------\n";
++      dbgs() << "  MI:";MI.dump();
++
++      for (auto &MOP : MI.operands()) {
++        if (MOP.isReg()) {
++          dbgs() << "    MOP: ";MOP.dump();
++          PKBA->dumpKnownBits(getKnownBitsMap(&MOP), 0);
++        }
++      }
++    }
++  }
++}
++
++__attribute__((unused))
++void RISCVPostRAFaultIndexCoalescer::dumpBranchFreq(MachineFunction &MF) {
++  return;
++}
++
++void RISCVPostRAFaultIndexCoalescer::dumpAccessMaps(MachineFunction &MF) {
++  dbgs() << "//========================================\n";
++  dbgs() << "+ print AccessMaps for "<< MF.getName() << "\n";
++  for (auto &MBB : MF) {
++    dbgs() << MBB.getFullName() << ":\n";
++    for (MachineInstr &MI : MBB) {
++      if (MI.isDebugInstr()) continue;
++      MI.dump();
++      for (auto &MOP : MI.operands()) {
++        if (!MOP.isReg()) continue;
++        dbgs() << "  MOP: "; MOP.dump();
++
++        // PrevAccMap
++        dbgs() << "    Prev accesses:\n";
++        if (PrevAccMap.find(&MOP) != PrevAccMap.end()) {
++          for (unsigned i = 0, e = PrevAccMap[&MOP].size(); i < e; i++) {
++            dbgs() << "    ("<<i<<"): "; PrevAccMap[&MOP][i]->getParent()->dump();
++          }
++        } else
++          dbgs() << "\n";
++
++        // NextAccMap
++        dbgs() << "    Next accesses:\n";
++        if (NextAccMap.find(&MOP) != NextAccMap.end()) {
++          for(unsigned i = 0, e = NextAccMap[&MOP].size(); i < e; i++) {
++            dbgs() << "    ("<<i<<"): "; NextAccMap[&MOP][i]->getParent()->dump();
++          }
++        } else
++          dbgs() << "\n";
++      }
++    }
++  }
++}
++
++void RISCVPostRAFaultIndexCoalescer::dumpDefMOPMap(MachineFunction &MF) {
++  dbgs() << "//========================================\n";
++  dbgs() << "+ print DefMOPMap for "<< MF.getName() << "\n";
++  for (auto &MBB :MF) {
++    dbgs() << MBB.getFullName() << ":\n";
++    for (MachineInstr &MI : MBB) {
++      if (MI.isDebugInstr()) continue;
++      MI.dump();
++      for (auto &MOP : MI.operands()) {
++        if (!MOP.isReg()) continue;
++        if (!MOP.isUse()) continue;
++        dbgs() << "  MOP: "; MOP.dump();
++
++        // DefMOPs
++        dbgs() << "    Def MIs:\n";
++        if (MRI->DefMOPMap.find(&MOP) != MRI->DefMOPMap.end()) {
++          for (unsigned i = 0, e = MRI->DefMOPMap[&MOP].size(); i < e; i++) {
++            dbgs() << "    ("<<i<<"): "; MRI->DefMOPMap[&MOP][i]->getParent()->dump();
++          }
++        } else {
++          dbgs() << "    MOP not found in DefMOPMap\n";
++        }
++        dbgs() << "\n";
++      }
++    }
++  }
++}
++
++void RISCVPostRAFaultIndexCoalescer::dumpFIResMap(MachineFunction &MF) {
++  for (auto &MBB : MF) {
++    dbgs() << MBB.getFullName() << "\n";
++    for (MachineInstr &MI : MBB) {
++      if (MI.isDebugInstr()) continue;
++      MI.dump();
++      unsigned mop_idx = 0;
++      for (auto &MOP : MI.operands()) {
++        if (FIResMap.find(&MOP) != FIResMap.end()) {
++          dbgs() << "  FIResMap MOP[idx="<<mop_idx<<"]: " << printReg(MOP.getReg(), TRI) <<"\t:\n";
++          unsigned prev_ri = 0;
++          for (unsigned i = 0, e = FIResMap[&MOP].size(); i < e; i++) {
++            if (i == 0) {
++              dbgs() << "    LSB";
++              dbgs() << "[" << (uint32_t)FIResMap[&MOP][i].first << "]: " << FIResMap[&MOP][i].second << "\n";
++            } else if (i == e-1) {
++              dbgs() << "    MSB";
++              dbgs() << "[" << (uint32_t)FIResMap[&MOP][i].first << "]: " << FIResMap[&MOP][i].second << "\n";
++            } else {
++              if (!(prev_ri +1 == FIResMap[&MOP][i].second)) {
++              dbgs() << "       ";
++              dbgs() << "[" << (uint32_t)FIResMap[&MOP][i].first << "]: " << FIResMap[&MOP][i].second << "\n";
++              }
++            }
++            prev_ri = FIResMap[&MOP][i].second;
++          }
++          dbgs() << "\n";
++        }
++        mop_idx++;
++      }
++    }
++  }
++}
++
++__attribute__((unused))
++void RISCVPostRAFaultIndexCoalescer::dumpFICandMap(MachineFunction &MF) {
++  for (auto &MBB : MF) {
++    dbgs() << MBB.getFullName() << "\n";
++    for (MachineInstr &MI : MBB) {
++      if (MI.isDebugInstr()) continue;
++      MI.dump();
++      for (auto &MOP : MI.operands()) {
++        if (FICandMap.find(&MOP) != FICandMap.end()) {
++          dbgs() << "    MOP: " << printReg(MOP.getReg(), TRI) <<"\t:\n";
++          unsigned UseMOP_i = 0;
++          for (auto &V : FICandMap[&MOP]) {
++            MachineOperand *UseMOP = V.first;
++            FIResTy UseFIRes = V.second;
++            dbgs() << "  CandMap UseMOP[" << UseMOP_i <<"]: " << printReg(UseMOP->getReg(), TRI)
++                   << "\t:"; UseMOP->getParent()->dump();
++            unsigned prev_ri = 0;
++            for (unsigned i = 0, e = UseFIRes.size(); i<e; i++) {
++              if (i == 0) {
++                dbgs() << "    LSB";
++                dbgs() << "[" << (uint32_t)UseFIRes[i].first << "]: " << UseFIRes[i].second << "\n";
++              } else if (i == e-1) {
++                dbgs() << "    MSB";
++                dbgs() << "[" << (uint32_t)UseFIRes[i].first << "]: " << UseFIRes[i].second << "\n";
++              } else {
++                if (!(prev_ri +1 == UseFIRes[i].second)) {
++                  dbgs() << "       ";
++                  dbgs() << "[" << (uint32_t)UseFIRes[i].first << "]: " << UseFIRes[i].second << "\n";
++                }
++              }
++              prev_ri = UseFIRes[i].second;
++            }
++            dbgs() << "\n";
++            UseMOP_i++;
++          }
++        }
++      }
++    }
++  }
++}
++
++__attribute__((unused))
++void RISCVPostRAFaultIndexCoalescer::dumpFaultSites(MachineFunction &MF) {
++  dbgs() << "** Dump Fault Sites for "<< MF.getName() << "\n";
++  for (auto &MBB : MF) {
++    dbgs() << MBB.getFullName() <<"\n";
++    for (auto &MI : MBB) {
++      if (MI.isDebugInstr()) continue;
++      MI.dump();
++      unsigned ctr = 0;
++      for (auto &V : FaultSites[&MI]) {
++        dbgs() << "    (" << (ctr++) <<") " << printReg(V.first, TRI) << ": "; V.second->getParent()->dump();
++      }
++    }
++    dbgs() << "\n";
++  }
++}
++
++void RISCVPostRAFaultIndexCoalescer::getNextAccs(MachineOperand *MOP,
++    SmallVector<MachineOperand*, 4> &nextUses) {
++  Register Reg = MOP->getReg();
++  SmallVector<MachineOperand*, 4> UseMOPs;
++  SmallVector<MachineOperand*, 4> DefMOPs;
++
++  ACCESS_LLVM_DEBUG(dbgs() << "      Use operands of " << printReg(Reg, TRI) << ":\n");
++  for (MachineOperand &mop : MRI->use_operands(Reg)) {
++    if (mop.getParent()->isDebugInstr()) continue;
++    UseMOPs.push_back(&mop);
++    ACCESS_LLVM_DEBUG(dbgs() << "          "; mop.getParent()->dump());
++  }
++  ACCESS_LLVM_DEBUG(dbgs() << "\n");
++
++  ACCESS_LLVM_DEBUG(dbgs() << "      Def operands of " << printReg(Reg, TRI) << ":\n");
++  for (MachineOperand &mop : MRI->def_operands(Reg)) {
++    if (mop.getParent()->isDebugInstr()) continue;
++    DefMOPs.push_back(&mop);
++    ACCESS_LLVM_DEBUG(dbgs() << "          "; mop.getParent()->dump());
++  }
++  ACCESS_LLVM_DEBUG(dbgs() << "\n");
++
++
++  for (unsigned i = 0, ie = pIndepPaths.size(); i < ie; i++) {
++    // foundCurMOP checks if we are in the live range of interset.
++    bool foundCurMOP = false;
++    bool foundNextDefAcc = false;
++    // Note that immediate next use is not of interest, because any uses
++    // before the next def (to be overwitten) will be affected by a single
++    // bit corruption happened earlier.
++    //bool foundNextUseAcc = false;
++    SmallVector<MachineBasicBlock*, 4> path = pIndepPaths[i];
++    for (unsigned j = 0, je = path.size(); j < je; j++) {
++      for (MachineInstr &mi : *path[j]) {
++        if (mi.isDebugInstr()) continue;
++        // Need to find the MI of the given MOP first.
++        if (!foundCurMOP) {
++          for (MachineOperand &mop : mi.operands()) {
++            if (MOP == &mop) {
++              foundCurMOP = true;
++              break;
++            }
++          }
++          // Use can only happen in the later instructions.
++          if (foundCurMOP)
++            continue;
++        } else {
++          for (MachineOperand &mop : mi.operands()) {
++            if (isMOPInList(&mop, UseMOPs)) {
++              if (!isMOPInList(&mop, nextUses)) {
++                nextUses.push_back(&mop);
++              }
++            }
++            if (isMOPInList(&mop, DefMOPs)) {
++              foundNextDefAcc = true;
++            }
++          }
++          if (foundNextDefAcc)
++            break;
++        }
++        // only the first use of the path is worth knowing.
++        if (foundNextDefAcc) break;
++      }
++      // only the first use of the path is worth knowing.
++      if (foundNextDefAcc) break;
++    }
++  }
++}
++
++bool RISCVPostRAFaultIndexCoalescer::hasOnlyOnePrevAcc(MachineOperand *MOP) {
++  assert(PrevAccMap.find(MOP) != PrevAccMap.end()
++         && "MOP not found in PrevAccMap");
++  return PrevAccMap[MOP].size() == 1;
++}
++
++void RISCVPostRAFaultIndexCoalescer::setKnownBitsMap(MachineOperand *MOP, KnownBits KB) {
++  KnownBitsMap[MOP] = KB;
++}
++
++KnownBits RISCVPostRAFaultIndexCoalescer::getKnownBitsMap(MachineOperand *MOP) {
++  auto entry = KnownBitsMap.find(MOP);
++  assert(entry != KnownBitsMap.end() && "MOP not found in KnownBitsMap");
++  return KnownBitsMap[MOP];
++}
++
++void RISCVPostRAFaultIndexCoalescer::getKnownBitsImm(MachineInstr &MI,
++    unsigned OpIdx, unsigned BitWidth, KnownBits &Known) {
++  if (!MI.getOperand(OpIdx).isImm()) {
++    LLVM_DEBUG(dbgs() << "RISCVKnownBitsInfo::Not an imm: ";
++        MI.getOperand(OpIdx).dump());
++    Known = KnownBits(BitWidth);
++    Known.resetAll();
++    return;
++  }
++  int64_t C = MI.getOperand(OpIdx).getImm();
++  APInt APC = APInt(BitWidth, std::abs(C));
++  if (C  < 0)
++    APC.negate();
++  Known = KnownBits::makeConstant(APC);
++}
++
++void RISCVPostRAFaultIndexCoalescer::collectIndependentPaths (
++                  SmallVector<SmallVector<MachineBasicBlock *, 4>, 4> *Paths,
++                  SmallVector<MachineBasicBlock *, 4> curPath,
++                  MachineBasicBlock *startMBB,
++                  MachineBasicBlock *endMBB) {
++  if ((endMBB && startMBB == endMBB)
++      || (startMBB->succ_size() == 0)) {
++    Paths->push_back(curPath);
++    return;
++  }
++
++  for (MachineBasicBlock* succ : startMBB->successors()) {
++    SmallVector<MachineBasicBlock*, 4> newPath(curPath.begin(), curPath.end());
++
++    if (!isMBBInList(succ, curPath))
++      newPath.push_back(succ);
++
++    // Current path met the return block. Terminate the recursion.
++    if (succ->isReturnBlock()) {
++      // Add the current path to the paths.
++      if (endMBB == nullptr || endMBB == succ) {
++        Paths->push_back(newPath);
++      }
++    } else {
++      // Cycle detected. Terminate the recursion.
++      if (isMBBInList(succ, curPath)) {
++        if (endMBB == nullptr || endMBB == succ) {
++          Paths->push_back(newPath);
++        }
++      // Valid path. Keep collecting on a new diverged path.
++      } else {
++        collectIndependentPaths(Paths, newPath, succ, endMBB);
++      }
++    }
++  }
++}
++
++__attribute__((unused))
++void RISCVPostRAFaultIndexCoalescer::deepCopyMap(RegMapTy &destMap,
++                                                         RegMapTy srcMap) {
++  for (auto &V : srcMap)
++    destMap[V.first] = V.second;
++}
++
++bool RISCVPostRAFaultIndexCoalescer::isMOPInList(MachineOperand *MO,
++                                       SmallVector<MachineOperand*, 4> list) {
++  for (unsigned i = 0; i < list.size(); i++) {
++    if (list[i] == MO)
++      return true;
++  }
++  return false;
++}
++
++
++__attribute__((unused))
++bool RISCVPostRAFaultIndexCoalescer::isMIInList(MachineInstr *MI,
++                                         SmallVector<MachineInstr*, 4> list) {
++  for (unsigned i = 0; i < list.size(); i++) {
++    if (list[i] == MI)
++      return true;
++  }
++  return false;
++}
++
++bool RISCVPostRAFaultIndexCoalescer::isMBBInList(
++            MachineBasicBlock *MBB, SmallVector<MachineBasicBlock*, 4> list) {
++  for (unsigned i = 0; i < list.size(); i++) {
++    if (list[i] == MBB)
++      return true;
++  }
++  return false;
++}
++
++__attribute__((unused))
++bool RISCVPostRAFaultIndexCoalescer::isMBBInMap(
++                                 MachineBasicBlock *MBB, FaultSiteMBBTy Map) {
++  if (Map.find(MBB) != Map.end())
++    return true;
++  return false;
++}
++
++__attribute__((unused))
++bool RISCVPostRAFaultIndexCoalescer::isRegInMap(Register Reg,
++                                                        RegMapTy Map) {
++  if (Map.find(Reg) != Map.end())
++    return true;
++  return false;
++}
++
++__attribute__((unused))
++void RISCVPostRAFaultIndexCoalescer::dump_paths(
++                   SmallVector<SmallVector<MachineBasicBlock*, 4>, 4> paths) {
++  dbgs() << "RISCVPostRAFaultIndexCoalescer: dump paths size of: " << paths.size() << "\n";
++  for(unsigned i = 0, e = paths.size(); i < e; i++)
++    dump_list(paths[i], i);
++}
++
++__attribute__((unused))
++void RISCVPostRAFaultIndexCoalescer::dump_list(
++                       SmallVector<MachineBasicBlock*, 4> path, unsigned id) {
++  dbgs() << "  : "<< id << ": size " << path.size() << ": ";
++  path[0]->printName(dbgs());
++  for(unsigned i = 1, e = path.size(); i < e; i++) {
++    dbgs() << " -> "; path[i]->printName(dbgs());
++  }
++  dbgs() << "\n";
++}
++} // end of anonymous namespace
++
++INITIALIZE_PASS_BEGIN(RISCVPostRAFaultIndexCoalescer, DEBUG_TYPE,
++            RISCV_POSTRA_FAULTINDEX_COALESCER_NAME, false, false)
++INITIALIZE_PASS_DEPENDENCY(PhysKnownBitsAnalysisWrapper)
++INITIALIZE_PASS_END(RISCVPostRAFaultIndexCoalescer, DEBUG_TYPE,
++            RISCV_POSTRA_FAULTINDEX_COALESCER_NAME, false, false)
++namespace llvm {
++
++FunctionPass *createRISCVPostRAFaultIndexCoalescerPass() { return new RISCVPostRAFaultIndexCoalescer(); }
++
++} // end of namespace llvm
+diff --git a/llvm/lib/Target/RISCV/RISCVTargetMachine.cpp b/llvm/lib/Target/RISCV/RISCVTargetMachine.cpp
+index cc881406666c..1417b08d7b6a 100644
+--- a/llvm/lib/Target/RISCV/RISCVTargetMachine.cpp
++++ b/llvm/lib/Target/RISCV/RISCVTargetMachine.cpp
+@@ -82,6 +82,8 @@ extern "C" LLVM_EXTERNAL_VISIBILITY void LLVMInitializeRISCVTarget() {
+   initializeRISCVExpandPseudoPass(*PR);
+   initializeRISCVInsertVSETVLIPass(*PR);
+   initializeRISCVDAGToDAGISelPass(*PR);
++
++  initializeRISCVPostRAFaultIndexCoalescerPass(*PR);
+ }
+ 
+ static StringRef computeDataLayout(const Triple &TT) {
+@@ -323,7 +325,10 @@ bool RISCVPassConfig::addGlobalInstructionSelect() {
+   return false;
+ }
+ 
+-void RISCVPassConfig::addPreSched2() {}
++void RISCVPassConfig::addPreSched2() {
++  // Perform Result Index Analysis for post-ra machine instr scheduler
++  addPass(createRISCVPostRAFaultIndexCoalescerPass());
++}
+ 
+ void RISCVPassConfig::addPreEmitPass() {
+   addPass(&BranchRelaxationPassID);
+@@ -336,6 +341,7 @@ void RISCVPassConfig::addPreEmitPass2() {
+   // possibility for other passes to break the requirements for forward
+   // progress in the LR/SC block.
+   addPass(createRISCVExpandAtomicPseudoPass());
++  addPass(createRISCVPostRAFaultIndexCoalescerPass());
+ }
+ 
+ void RISCVPassConfig::addMachineSSAOptimization() {
+-- 
+2.25.1
+

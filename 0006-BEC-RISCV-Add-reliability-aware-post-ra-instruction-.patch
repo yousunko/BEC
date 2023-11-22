@@ -1,0 +1,298 @@
+From 397239a994fa76e4ed8de9b4b7e1904961b8acbb Mon Sep 17 00:00:00 2001
+From: "yousun.ko@yonsei.ac.kr" <yousun.ko@yonsei.ac.kr>
+Date: Sat, 18 Nov 2023 22:02:37 +0900
+Subject: [PATCH 6/7] [BEC][RISCV] Add reliability-aware post-ra instruction
+ scheduler for RISC-V
+
+---
+ llvm/lib/Target/RISCV/CMakeLists.txt          |   1 +
+ .../Target/RISCV/RISCVMachineScheduler.cpp    | 128 ++++++++++++++++++
+ llvm/lib/Target/RISCV/RISCVMachineScheduler.h |  38 ++++++
+ llvm/lib/Target/RISCV/RISCVSubtarget.h        |   1 +
+ llvm/lib/Target/RISCV/RISCVTargetMachine.cpp  |  25 +++-
+ 5 files changed, 192 insertions(+), 1 deletion(-)
+ create mode 100644 llvm/lib/Target/RISCV/RISCVMachineScheduler.cpp
+ create mode 100644 llvm/lib/Target/RISCV/RISCVMachineScheduler.h
+
+diff --git a/llvm/lib/Target/RISCV/CMakeLists.txt b/llvm/lib/Target/RISCV/CMakeLists.txt
+index 89d0851e21ff..7310cccee840 100644
+--- a/llvm/lib/Target/RISCV/CMakeLists.txt
++++ b/llvm/lib/Target/RISCV/CMakeLists.txt
+@@ -49,6 +49,7 @@ add_llvm_target(RISCVCodeGen
+ 
+   RISCVKnownBitsInfo.cpp
+   RISCVPostRAFaultIndexCoalescer.cpp
++  RISCVMachineScheduler.cpp
+ 
+   LINK_COMPONENTS
+   Analysis
+diff --git a/llvm/lib/Target/RISCV/RISCVMachineScheduler.cpp b/llvm/lib/Target/RISCV/RISCVMachineScheduler.cpp
+new file mode 100644
+index 000000000000..43623f9eac51
+--- /dev/null
++++ b/llvm/lib/Target/RISCV/RISCVMachineScheduler.cpp
+@@ -0,0 +1,128 @@
++//===-- RISCVMachineScheduler.cpp - MI Scheduler for RISC-V ---------------===//
++//
++// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
++// See https://llvm.org/LICENSE.txt for license information.
++// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++//
++//===----------------------------------------------------------------------===//
++
++#include "RISCVMachineScheduler.h"
++#include "MCTargetDesc/RISCVMCTargetDesc.h"
++
++using namespace llvm;
++
++bool RISCVPostRASchedStrategy::tryCandidate(SchedCandidate &Cand,
++                                            SchedCandidate &TryCand) {
++  // From llvm/lib/CodeGen/MachineScheduler.cpp:PostGenericScheduler::tryCandidate
++  if ((Cand.SU && Cand.SU->isInstr()) && (TryCand.SU && TryCand.SU->isInstr())) {
++    MachineInstr* CandMI = Cand.SU->getInstr();
++    MachineInstr* TryCandMI = TryCand.SU->getInstr();
++    // Number of bits that are live out after this MI
++    unsigned bitsCand = 0;
++    unsigned bitsTryCand = 0;
++
++    // Compute for Cand
++    for (MachineOperand &MOP : CandMI->operands()) {
++      if (CandMI->RIMap.find(&MOP) != CandMI->RIMap.end()) {
++        for (unsigned i = 0, e = CandMI->RIMap[&MOP].size(); i < e; i++) {
++          if (CandMI->RIMap[&MOP][i].second != 0) {
++            bitsCand++;
++          }
++        }
++      }
++    }
++
++    // Compute for TryCand
++    for (MachineOperand &MOP : TryCandMI->operands()) {
++      if (TryCandMI->RIMap.find(&MOP) != TryCandMI->RIMap.end()) {
++        for (unsigned i = 0, e = TryCandMI->RIMap[&MOP].size(); i < e; i++) {
++          if (TryCandMI->RIMap[&MOP][i].second != 0) {
++            bitsTryCand++;
++          }
++        }
++      }
++    }
++
++    // Return true if TryCand is better
++    // select to minimize the by live out bits (best)
++    if (bitsCand > bitsTryCand) {
++      TryCand.Reason = NodeOrder;
++      return true;
++    } else {
++      return false;
++    }
++
++    /*
++    // select to maximze the live out bits (worst)
++    if (bitsCand < bitsTryCand) {
++      TryCand.Reason = NodeOrder;
++      return true;
++    } else {
++      return false;
++    }
++    */
++  }
++
++  // Initialize the candidate if needed.
++  if (!Cand.isValid()) {
++    TryCand.Reason = NodeOrder;
++    return true;
++  }
++
++  // Prioritize instructions that read unbuffered resources by stall cycles.
++  if (tryLess(Top.getLatencyStallCycles(TryCand.SU),
++              Top.getLatencyStallCycles(Cand.SU), TryCand, Cand, Stall))
++    return TryCand.Reason != NoCand;
++
++  // Keep clustered nodes together.
++  if (tryGreater(TryCand.SU == DAG->getNextClusterSucc(),
++                 Cand.SU == DAG->getNextClusterSucc(), TryCand, Cand, Cluster))
++    return TryCand.Reason != NoCand;
++
++  // Avoid critical resource consumption and balance the schedule.
++  if (tryLess(TryCand.ResDelta.CritResources, Cand.ResDelta.CritResources,
++              TryCand, Cand, ResourceReduce))
++    return TryCand.Reason != NoCand;
++  if (tryGreater(TryCand.ResDelta.DemandedResources,
++                 Cand.ResDelta.DemandedResources, TryCand, Cand,
++                 ResourceDemand))
++    return TryCand.Reason != NoCand;
++
++  // Avoid serializing long latency dependence chains.
++  if (Cand.Policy.ReduceLatency && tryLatency(TryCand, Cand, Top)) {
++    return TryCand.Reason != NoCand;
++  }
++
++  // Fall through to original instruction order.
++  if (TryCand.SU->NodeNum < Cand.SU->NodeNum)
++    TryCand.Reason = NodeOrder;
++
++  // PostGenericScheduler::tryCandidate end
++
++  // Add powerpc post ra specific heuristic only when TryCand isn't selected or
++  // selected as node order.
++  if (TryCand.Reason != NodeOrder && TryCand.Reason != NoCand)
++    return true;
++
++  return TryCand.Reason != NoCand;
++}
++
++void RISCVPostRASchedStrategy::enterMBB(MachineBasicBlock *MBB) {
++  // Custom PPC PostRA specific behavior here.
++  PostGenericScheduler::enterMBB(MBB);
++}
++
++void RISCVPostRASchedStrategy::leaveMBB() {
++  // Custom PPC PostRA specific behavior here.
++  PostGenericScheduler::leaveMBB();
++}
++
++void RISCVPostRASchedStrategy::initialize(ScheduleDAGMI *Dag) {
++  // Custom PPC PostRA specific initialization here.
++  PostGenericScheduler::initialize(Dag);
++}
++
++SUnit *RISCVPostRASchedStrategy::pickNode(bool &IsTopNode) {
++  // Custom PPC PostRA specific scheduling here.
++  return PostGenericScheduler::pickNode(IsTopNode);
++}
+diff --git a/llvm/lib/Target/RISCV/RISCVMachineScheduler.h b/llvm/lib/Target/RISCV/RISCVMachineScheduler.h
+new file mode 100644
+index 000000000000..94c7d3de3529
+--- /dev/null
++++ b/llvm/lib/Target/RISCV/RISCVMachineScheduler.h
+@@ -0,0 +1,38 @@
++//===--- RISCVMachineScheduler.h - MI scheduler for RISC-V ----------------===//
++//
++// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
++// See https://llvm.org/LICENSE.txt for license information.
++// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++//
++//===----------------------------------------------------------------------===//
++//
++// Custom RISCV MI scheduler.
++//
++//===----------------------------------------------------------------------===//
++
++#ifndef LLVM_LIB_TARGET_RISCV_RISCVMACHINESCHEDULER_H
++#define LLVM_LIB_TARGET_RISCV_RISCVMACHINESCHEDULER_H
++
++#include "llvm/CodeGen/MachineScheduler.h"
++
++namespace llvm {
++
++/// A MachineSchedStrategy implementation for RISCV post RA scheduling.
++class RISCVPostRASchedStrategy : public PostGenericScheduler {
++public:
++  RISCVPostRASchedStrategy(const MachineSchedContext *C) :
++    PostGenericScheduler(C) {}
++
++protected:
++  void initialize(ScheduleDAGMI *Dag) override;
++  SUnit *pickNode(bool &IsTopNode) override;
++  void enterMBB(MachineBasicBlock *MBB) override;
++  void leaveMBB() override;
++
++  bool tryCandidate(SchedCandidate &Cand, SchedCandidate &TryCand) override;
++  bool biasAddiCandidate(SchedCandidate &Cand, SchedCandidate &TryCand) const;
++};
++
++} // end namespace llvm
++
++#endif // LLVM_LIB_TARGET_RISCV_RISCVMACHINESCHEDULER_H
+diff --git a/llvm/lib/Target/RISCV/RISCVSubtarget.h b/llvm/lib/Target/RISCV/RISCVSubtarget.h
+index 230e2e371d77..8c253b1fdda5 100644
+--- a/llvm/lib/Target/RISCV/RISCVSubtarget.h
++++ b/llvm/lib/Target/RISCV/RISCVSubtarget.h
+@@ -99,6 +99,7 @@ public:
+     return &TSInfo;
+   }
+   bool enableMachineScheduler() const override { return true; }
++  bool enablePostRAScheduler() const override { return true; }
+ 
+   /// Returns RISCV processor family.
+   /// Avoid this function! CPU specifics should be kept local to this class
+diff --git a/llvm/lib/Target/RISCV/RISCVTargetMachine.cpp b/llvm/lib/Target/RISCV/RISCVTargetMachine.cpp
+index 1417b08d7b6a..a898528451fe 100644
+--- a/llvm/lib/Target/RISCV/RISCVTargetMachine.cpp
++++ b/llvm/lib/Target/RISCV/RISCVTargetMachine.cpp
+@@ -14,6 +14,7 @@
+ #include "MCTargetDesc/RISCVBaseInfo.h"
+ #include "RISCV.h"
+ #include "RISCVMachineFunctionInfo.h"
++#include "RISCVMachineScheduler.h"
+ #include "RISCVMacroFusion.h"
+ #include "RISCVTargetObjectFile.h"
+ #include "RISCVTargetTransformInfo.h"
+@@ -24,6 +25,7 @@
+ #include "llvm/CodeGen/GlobalISel/InstructionSelect.h"
+ #include "llvm/CodeGen/GlobalISel/Legalizer.h"
+ #include "llvm/CodeGen/GlobalISel/RegBankSelect.h"
++#include "llvm/CodeGen/MachineScheduler.h"
+ #include "llvm/CodeGen/MIRParser/MIParser.h"
+ #include "llvm/CodeGen/MIRYamlMapping.h"
+ #include "llvm/CodeGen/Passes.h"
+@@ -98,6 +100,13 @@ static Reloc::Model getEffectiveRelocModel(const Triple &TT,
+   return RM.value_or(Reloc::Static);
+ }
+ 
++static ScheduleDAGInstrs *createRISCVPostMachineScheduler(
++  MachineSchedContext *C) {
++  ScheduleDAGMI *DAG =
++    new ScheduleDAGMI(C, std::make_unique<RISCVPostRASchedStrategy>(C), true);
++  return DAG;
++}
++
+ RISCVTargetMachine::RISCVTargetMachine(const Target &T, const Triple &TT,
+                                        StringRef CPU, StringRef FS,
+                                        const TargetOptions &Options,
+@@ -222,7 +231,10 @@ namespace {
+ class RISCVPassConfig : public TargetPassConfig {
+ public:
+   RISCVPassConfig(RISCVTargetMachine &TM, PassManagerBase &PM)
+-      : TargetPassConfig(TM, PM) {}
++      : TargetPassConfig(TM, PM) {
++    if (TM.getOptLevel() != CodeGenOpt::None)
++      substitutePass(&PostRASchedulerID, &PostMachineSchedulerID);
++  }
+ 
+   RISCVTargetMachine &getRISCVTargetMachine() const {
+     return getTM<RISCVTargetMachine>();
+@@ -241,12 +253,18 @@ public:
+ 
+   ScheduleDAGInstrs *
+   createPostMachineScheduler(MachineSchedContext *C) const override {
++    if (true /* enable soft-error reliability-aware post-ra scheduling */) {
++      return createRISCVPostMachineScheduler(C);
++    }
++
+     const RISCVSubtarget &ST = C->MF->getSubtarget<RISCVSubtarget>();
+     if (ST.hasMacroFusion()) {
+       ScheduleDAGMI *DAG = createGenericSchedPostRA(C);
+       DAG->addMutation(createRISCVMacroFusionDAGMutation());
+       return DAG;
+     }
++
++
+     return nullptr;
+   }
+ 
+@@ -367,6 +385,11 @@ void RISCVPassConfig::addPostRegAlloc() {
+     addPass(createRISCVRedundantCopyEliminationPass());
+ }
+ 
++static MachineSchedRegistry
++RISCVPostRASchedRegistry("riscv-postra",
++                         "Run RISCV Post-RA scheduler",
++                         createRISCVPostMachineScheduler);
++
+ yaml::MachineFunctionInfo *
+ RISCVTargetMachine::createDefaultFuncInfoYAML() const {
+   return new yaml::RISCVMachineFunctionInfo();
+-- 
+2.25.1
+

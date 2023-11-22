@@ -1,0 +1,43 @@
+From 1b779b394a8d8967b40be1b2cefff6758bc1e18a Mon Sep 17 00:00:00 2001
+From: "yousun.ko@yonsei.ac.kr" <yousun.ko@yonsei.ac.kr>
+Date: Thu, 23 Nov 2023 01:46:41 +0900
+Subject: [PATCH 7/7] [BEC][RISCV] Activate the worst reliability-aware post-ra
+ instruction scheduler for RISC-V
+
+---
+ llvm/lib/Target/RISCV/RISCVMachineScheduler.cpp | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/llvm/lib/Target/RISCV/RISCVMachineScheduler.cpp b/llvm/lib/Target/RISCV/RISCVMachineScheduler.cpp
+index 43623f9eac51..0e0a8797499e 100644
+--- a/llvm/lib/Target/RISCV/RISCVMachineScheduler.cpp
++++ b/llvm/lib/Target/RISCV/RISCVMachineScheduler.cpp
+@@ -44,6 +44,7 @@ bool RISCVPostRASchedStrategy::tryCandidate(SchedCandidate &Cand,
+     }
+ 
+     // Return true if TryCand is better
++    /*
+     // select to minimize the by live out bits (best)
+     if (bitsCand > bitsTryCand) {
+       TryCand.Reason = NodeOrder;
+@@ -51,8 +52,8 @@ bool RISCVPostRASchedStrategy::tryCandidate(SchedCandidate &Cand,
+     } else {
+       return false;
+     }
++    */
+ 
+-    /*
+     // select to maximze the live out bits (worst)
+     if (bitsCand < bitsTryCand) {
+       TryCand.Reason = NodeOrder;
+@@ -60,7 +61,6 @@ bool RISCVPostRASchedStrategy::tryCandidate(SchedCandidate &Cand,
+     } else {
+       return false;
+     }
+-    */
+   }
+ 
+   // Initialize the candidate if needed.
+-- 
+2.25.1
+
