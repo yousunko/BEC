@@ -1,11 +1,10 @@
 # BEC analysis
 
-Bit-level Error Coalescing (BEC) analysis is an LLVM analysis pass that 
-tracks and classifies the effect of corruption due to soft error of a program
-at compile time.
+Bit-level Error Coalescing (BEC) analysis is a static analysis that
+tracks and classifies the effect of the program corruption due to soft errors.
 
-This repository contains the implementation of BEC and its application on the
-LLVM instruction scheduler.
+This repository contains an LLVM implementation of BEC and its application
+to the LLVM instruction scheduler.
 
 
 # Contacts
@@ -23,8 +22,8 @@ cd llvm-project
 git checkout tags/llvmorg-16.0.0
 ```
 
-Apply patches under the repository using ``git apply``.
-For example, the command below applies the first patch to the repository.
+Apply patches on top of the repository by using ``git apply``.
+For example, the command below applies the first patch on to the repository.
 
 ```
 git apply 0001-BEC-Generate-auxiliary-register-infor-in-assembly.patch
@@ -35,6 +34,6 @@ Apply patches up to ``0005-BEC-RISCV-Add-post-ra-Fault-Index-Coalescer-for-RISC.
 
 The patch ``0006-BEC-RISCV-Add-reliability-aware-post-ra-instruction-.patch`` enables the vulnerability-aware instruction scheduler to minimize the susceptibility to soft errors based on the BEC analysis.
 
-Applying the patch ``0007-BEC-RISCV-Activate-the-worst-reliability-aware-post-.patch`` on top of all the other patches to enables the vulnerability-aware instruction scheduler, but to **maximize** the susceptibility to soft errors.
+Apply the patch ``0007-BEC-RISCV-Activate-the-worst-reliability-aware-post-.patch`` on top of all the other patches to enables the vulnerability-aware instruction scheduler, but to **maximize** the susceptibility to soft errors.
 
-Find the [Getting Started with the LLVM System](https://llvm.org/docs/GettingStarted.html) page for further information on how to build and install LLVM.
+Find the [Getting Started with the LLVM System](https://llvm.org/docs/GettingStarted.html) page for further information on how to build and install LLVM from source codes.
